@@ -3,7 +3,7 @@ The goal of this repository is to do scalable diffusion model training on TPUs w
 
 To get started, first SSH into the TPU-VM, then clone this repository and navigate into it. Then:
 
-``pip install "jax[tpu]==0.3.17" -f [https://storage.googleapis.com/jax-releases/libtpu_releases.html](https://storage.googleapis.com/jax-releases/libtpu_releases.html "https://storage.googleapis.com/jax-releases/libtpu_releases.html") ``
+``pip install "jax[tpu]==0.3.14" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html ``
 
 `` pip install -r requirements.txt ``
 
