@@ -1,13 +1,21 @@
 ### DDPM training with JAX + TPU
 The goal of this repository is to do scalable diffusion model training on TPUs with JAX. 
 
-To get started, first SSH into the TPU-VM, then clone this repository and navigate into it. Then:
+First, create a TPU-VM, e.g:
+``gcloud compute tpus tpu-vm create jaxddpm --zone us-central1-f --accelerator-type v2-8 --version tpu-vm-base``
+
+SSH into the TPU-VM via: 
+``gcloud alpha compute tpus tpu-vm ssh jaxddpm --zone us-central1-f``
+
+then clone this repository and navigate into it. Run the following:
 
 ``pip install "jax[tpu]==0.3.17" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html ``
 
 `` pip install -r requirements.txt ``
 
 ``python3 train.py --config config/expm1_config.py --global_dir "gs://bucket_name"``
+
+For now, our training checkpoints and logs are publicly available at gs://jax-ddpm-training
 
 Roadmap:
 
