@@ -1,0 +1,6 @@
+flax==0.5.3
+ml_collections
+diffusers
+tensorflow==2.10.0
+tensorflow_datasets
+optax
