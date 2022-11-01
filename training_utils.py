@@ -16,7 +16,7 @@ def copy_pytree(pytree):
     return jax.tree_util.tree_map(jnp.array, pytree)
 
 def save_checkpoint(state, ckpt_dir, ckpt_path=None, unreplicate=False, keep=99):
-    if unreplicate: state = jax.device_get(flax.jax_utils.unreplicate(state))
+    if unreplicate: state = unreplicate(state)
     checkpoints.save_checkpoint(ckpt_dir=ckpt_dir, target=state, step=state.step, keep=keep)
 
 def restore_checkpoint(empty_state, ckpt_dir=None, ckpt_path=None, step=None):

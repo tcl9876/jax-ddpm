@@ -10,7 +10,6 @@ from tensorflow.config import set_visible_devices as tf_set_visible_devices
 from tensorflow.io import gfile, write_file
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-import warnings
 
 from training_utils import EMATrainState, unreplicate, copy_pytree, count_params, save_checkpoint, train_step_fn, train_loss_fn, print_and_log, Metrics
 from unet_condition_2d_flax import FlaxUNet2DConditionModel
@@ -21,7 +20,6 @@ import optax
 tf_set_visible_devices([], device_type="GPU")
 np.set_printoptions(precision=4)
 jnp.set_printoptions(precision=4)
-#warnings.filterwarnings("ignore", message=".*tensorflow/stream_executor.*")
 
 
 args = flags.FLAGS
