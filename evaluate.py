@@ -1,4 +1,3 @@
-from cgitb import text
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -6,16 +5,14 @@ import flax
 from jax import random
 import time
 import os
-from functools import partial
 from tensorflow.config import set_visible_devices as tf_set_visible_devices
 from tensorflow.io import gfile, write_file, read_file
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-from training_utils import restore_checkpoint
-from unet_condition_2d_flax import FlaxUNet2DConditionModel
-from flax_pipeline import FlaxGeneralDiffusionPipeline
-import diffusers
+from checkpoints import latest_checkpoint_path
+from model import Model
 import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
 
 tf_set_visible_devices([], device_type="GPU")
 np.set_printoptions(precision=4)
@@ -26,10 +23,12 @@ config_flags.DEFINE_config_file("config", None, "the location of the config path
 flags.DEFINE_string("checkpoint_dir", None, "the global directory you will save all training stuff into.")
 flags.DEFINE_string("save_dir", None, "the directory to save your results to.")
 flags.DEFINE_string("n_samples", "36", "the number of samples you want to create. can be comma-separated list.")
-flags.DEFINE_integer("n_steps", 200, "how many evaluation steps you want to use")
+flags.DEFINE_integer("n_steps", 1000, "how many evaluation steps you want to use")
 flags.DEFINE_integer("max_batch_size", 64, "the maximum allowable batch size for sampling.")
+flags.DEFINE_integer("height", 32, "image height.")
+flags.DEFINE_integer("width", 32, "image width.")
 flags.DEFINE_integer("nrow", 6, "if you are making a grid, the number of columns in the grid. By default, we use 6 columns.")
-#flags.DEFINE_string("guidance_scale", "0.0", "the guidance weight for classifier-free guidance.")
+flags.DEFINE_string("guidance_scale", "1.0", "the guidance weight for classifier-free guidance.")
 flags.DEFINE_string("save_format", "grid", "either 'grid' or 'npz'. determines whether to save results as a grid of images (default, best for <= 100 images), or as an .npz file (for evaluation).")
 flags.mark_flags_as_required(["config", "checkpoint_dir", "save_dir"])
 
@@ -68,61 +67,61 @@ def main(_):
     config = args.config
     config.unlock()
 
-    margs = config.model
-    sargs = config.schedule
-    unet = FlaxUNet2DConditionModel(**margs)
+    model = Model(config)
+    ckpt_path = latest_checkpoint_path(args.checkpoint_dir, prefix='checkpoint_')
+    with gfile.GFile(ckpt_path, 'rb') as fp:
+        restored_sd = flax.serialization.from_bytes(None, fp.read())
+    
 
-    restored_sd = restore_checkpoint(None, args.checkpoint_dir)
-
+    """
     if config.schedule_name == "ddpm":
         scheduler = diffusers.FlaxDDIMScheduler(**sargs) #flaxpipeline doesnt accept DDPMScheduler as valid scheduler
     else: 
         raise NotImplementedError()
+    """
 
     params = {
         "unet": restored_sd["ema_params"],
-        "scheduler": scheduler.create_state()
+        #"scheduler": scheduler.create_state()
     }
 
     devices = jax.devices()
     print("DEVICES:", devices)
     params = flax.jax_utils.replicate(params, devices=devices)
 
-    pipe = FlaxGeneralDiffusionPipeline(
-        vae=None, 
-        text_encoder=None, 
-        tokenizer=None, 
-        unet=unet,
-        scheduler=scheduler,
-        safety_checker=None,
-        feature_extractor=None,
-        dtype=jnp.bfloat16
-    )
-
     #TODO: remove magic numbers
     n_samples_list = [int(n) for n in args.n_samples.split(",")]
     samples = np.zeros(shape=(0, 32, 32, 3)).astype('uint8')
+    
+    global_rng = jax.random.PRNGKey(0)
+
+    def samples_fn(rng, params, labels, num_steps, num_samples): 
+        return model.samples_fn(rng=rng,
+            params=params,
+            labels=labels,
+            num_steps=num_steps,
+            num_samples=num_samples
+        )
+    samples_fn = jax.pmap(samples_fn, axis_name='batch', static_broadcasted_argnums=(2, 3, 4))
+
     for n_samples in n_samples_list:
-        for n in range(0, n_samples, args.max_batch_size):
+        for n in tqdm(range(0, n_samples, args.max_batch_size)):
             batch_size = min(args.max_batch_size, n_samples - n)
-            prompt_ids = [None] * len(devices)
-            
-            rng = jax.random.PRNGKey(0)
-            rng = jax.random.split(rng, jax.device_count())
+            #prompt_ids = [None] * len(devices)
+            global_rng, *rng = jax.random.split(global_rng, jax.device_count() + 1)
+            rng = jax.device_put_sharded(rng, jax.devices())
 
-            current_images = pipe(
-                prompt_ids=prompt_ids,
-                params=params,
-                prng_seed=rng,
-                num_inference_steps=200,
-                height=32,
-                width=32,
-                guidance_scale=1.0,
-                jit=True
-            )
+            per_replica_bs = args.max_batch_size//jax.device_count()
+            current_images = samples_fn(
+                rng,
+                params["unet"],
+                None,
+                args.n_steps,
+                per_replica_bs
+            ).block_until_ready()
 
-            current_images = current_images.reshape(-1, 32, 32, 3)[:batch_size]
-            current_images = (current_images * 255).round().astype('uint8')
+            current_images = np.array(current_images.reshape(-1, 32, 32, 3))[:batch_size]
+            current_images = np.clip(current_images * 127.5 + 127.5, 0, 255).astype('uint8')
             samples = np.concatenate((samples, current_images), axis=0)
         
         ext = "png" if args.save_format.lower() == "grid" else "npz"

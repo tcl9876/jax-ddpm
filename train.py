@@ -1,123 +1,133 @@
+import os
+import time
+import functools
 import jax
 import jax.numpy as jnp
-import numpy as np
 import flax
-from jax import random
-import time
-import os
-from functools import partial
-from tensorflow.config import set_visible_devices as tf_set_visible_devices
-from tensorflow.io import gfile, write_file
+from matplotlib import pyplot as plt
+import numpy as onp
+import tensorflow.compat.v2 as tf
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-
-from training_utils import EMATrainState, unreplicate, copy_pytree, count_params, save_checkpoint, train_step_fn, train_loss_fn, print_and_log, Metrics
-from unet_condition_2d_flax import FlaxUNet2DConditionModel
-from dataset_utils import create_dataset
-import diffusers
-import optax
-
-tf_set_visible_devices([], device_type="GPU")
-np.set_printoptions(precision=4)
-jnp.set_printoptions(precision=4)
-
+from model import Model
+from checkpoints import save_checkpoint
+from utils import numpy_iter
+tf.enable_v2_behavior()
+from tensorflow.io import gfile
 
 args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
 flags.DEFINE_string("global_dir", None, "the global directory you will save all training stuff into.")
-#flags.DEFINE_string("data_dir", None, "the directory where your data is stored (or where it will be downloaded into).")
+flags.DEFINE_string("data_dir", None, "the directory where your data is stored (or where it will be downloaded into).")
 flags.mark_flags_as_required(["config", "global_dir"])
 
+def unreplicate(x):
+    return jax.device_get(flax.jax_utils.unreplicate(x))
+
+def print_and_log(*args, logfile_path):
+    print(*args)
+    for a in args:
+        with gfile.GFile(logfile_path, mode='a') as f:
+            f.write(str(a))
+
+    with gfile.GFile(logfile_path, mode='a') as f:
+        f.write('\n')
+
+class MeanObject(object):
+    def __init__(self):
+        self.reset_states()
+    
+    def __repr__(self):
+        return repr(self._mean)
+     
+    def reset_states(self):
+        self._mean = 0.
+        self._count = 0
+        
+    def update(self, new_entry):
+        assert isinstance(new_entry, float)# or L.shape == () #what is L? commenting out.
+        self._count = self._count + 1
+        self._mean = (1-1/self._count)*self._mean + new_entry/self._count
+        
+    def result(self):
+        return self._mean
+        
+class Metrics(object):
+    def __init__(self, metric_names):
+        self.names = metric_names
+        self._metric_dict = {
+            name: MeanObject() for name in self.names
+        }
+    
+    def __repr__(self):
+        return repr(self._metric_dict)
+    
+    def update(self, new_metrics):
+        for name in self.names:
+            self._metric_dict[name].update(new_metrics[name])
+        
+    def reset_states(self):
+        for name in self.names:
+            self._metric_dict[name].reset_states()
 
 def main(_):
-    #set up configs and dataset
     config, global_dir = args.config, args.global_dir
     config.unlock()
 
-    margs = config.model
-    dargs = config.dataset
-    sargs = config.schedule
-    oargs = config.optimizer
-    targs = config.training_args
-
     if not gfile.isdir(global_dir):
         gfile.makedirs(global_dir)
-
-    #dargs.data_dir = dargs.data_dir.format(args.data_dir)
-    dargs.batch_size = targs.batch_size #set tfds dataloader batch size based on specified batch size in training args.
+    
+    targs = config.train
+    #dargs.batch_size = targs.batch_size #set tfds dataloader batch size based on specified batch size in training args.
     targs.checkpoint_dirs = [subdir.format(global_dir) for subdir in targs.checkpoint_dirs]
     targs.log_dir = targs.log_dir.format(global_dir)
-
-    dataset = create_dataset(dargs)
-
-    #create logfile
+    
     logfile_path = os.path.join(targs.log_dir, 'logfile.txt')
     if not gfile.exists(logfile_path):
-        write_file(logfile_path, "")
-    printl = partial(print_and_log, logfile_path=logfile_path)
+        tf.io.write_file(logfile_path, "")
+    printl = functools.partial(print_and_log, logfile_path=logfile_path)
 
-    if config.schedule_name == "ddpm":
-        schedule = diffusers.FlaxDDPMScheduler(**sargs)
+    #TODO: add checkpoint restoration.
+    model = Model(config)
+    state = jax.device_get(model.make_init_state())
+    state = flax.jax_utils.replicate(state)
 
-    #create model, prng train state, train functions that we'll use for training
-    model = FlaxUNet2DConditionModel(**margs)
-    global_key = jax.random.PRNGKey(seed=0)
-    global_key, init_key = jax.random.split(global_key, 2)
-    params = model.init_weights(init_key)
-    print('Total Parameters:', count_params(params))
-    
-    optimizer = optax.adam(oargs.lr, b1=oargs.b1, b2=oargs.b2, eps=oargs.eps)
-    state = EMATrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        ema_params=copy_pytree(params),
-        tx=optimizer,
-        ema_decay=0.9999,
-    )
-    train_lossfn = partial(train_loss_fn, schedule_alphas_cumprod=schedule.alphas_cumprod)
-    train_step = partial(train_step_fn, train_lossfn=train_lossfn)
+    train_step = functools.partial(model.step_fn, jax.random.PRNGKey(0), True)
+    train_step = functools.partial(jax.lax.scan, train_step)  # for substeps
+    train_step = jax.pmap(train_step, axis_name='batch', donate_argnums=(0,))
 
-    #replicate across tpu cores
-    devices = jax.devices()
-    print("Devices:", devices)
-    state = flax.jax_utils.replicate(state, devices=devices)
-    p_train_step = jax.pmap(
-        fun=jax.jit(train_step),
-        axis_name='shards',
-    )
+    total_bs = config.train.batch_size
+    device_bs = total_bs // jax.device_count()
+    train_ds = model.dataset.get_shuffled_repeated_dataset(
+        split='train',
+        batch_shape=(
+            jax.local_device_count(),  # for pmap
+            config.train.substeps,  # for lax.scan over multiple substeps
+            device_bs,  # batch size per device
+        ),
+        local_rng=jax.random.PRNGKey(0),
+        augment=True)
+    train_iter = numpy_iter(train_ds)
 
-    #run the actual training process
     s = time.time()
-    metrics = Metrics(['loss'])
-    for global_step, (train_inputs) in zip(range(int(unreplicate(state.step)), targs.iterations), dataset):
-        # Train step
-        global_key, *device_keys = random.split(global_key, num=jax.local_device_count() + 1)
-        device_keys = jax.device_put_sharded(device_keys, devices)
-
-        state, new_metrics, global_norm = p_train_step(
-            device_keys,
-            state,
-            train_inputs
-        )
-        
-        if global_step%20==0:
+    metrics = Metrics(["train/gnorm", "train/loss"])
+    for global_step in range(20001):
+        batch = next(train_iter)
+        state, new_metrics = train_step(state, batch)
+        if global_step%2==0 or global_step < 100:
             new_metrics = unreplicate(new_metrics)
             new_metrics = jax.tree_map(lambda x: float(x.mean()), new_metrics)
-            gnorm = unreplicate(global_norm)
-            gnorm = jax.tree_map(lambda x: float(x.mean()), gnorm)
-
-            new_metrics['global_norm'] = gnorm
             metrics.update(new_metrics)
 
-        if global_step % targs.log_freq==0: 
-            printl(f'Real Step: {unreplicate(state.step)}, Batches passed this session: {global_step},  Metrics: {metrics}, Gnorm: {gnorm}, Time {round(time.time()-s)}s')
-
+        if global_step % targs.log_loss_every_steps==0 or global_step < 100: 
+            printl(f'Real Step: {unreplicate(state.step)}, Batches passed this session: {global_step},  Metrics: {metrics}, Time {round(time.time()-s)}s')
             metrics.reset_states()
         
         for checkpoint_dir, num_checkpoints, save_freq in zip(targs.checkpoint_dirs, targs.num_checkpoints, targs.save_freq):
             if global_step%save_freq==0:
-                save_checkpoint(state, checkpoint_dir, unreplicate=True, keep=num_checkpoints)
-
+                unreplicated_state = unreplicate(state)
+                save_checkpoint(checkpoint_dir, unreplicated_state, keep=num_checkpoints, step=unreplicated_state.step)
+    
 
 if __name__ == '__main__':
     app.run(main)

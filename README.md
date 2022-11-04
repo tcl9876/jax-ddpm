@@ -17,13 +17,16 @@ then clone this repository and navigate into it. Run the following:
 
 For now, our training checkpoints and logs are publicly available at gs://jax-ddpm-training
 
-Roadmap:
+To-do's (not strictly in order)
 
 - [x] write basic training code
-- [ ] test training code on small-scale (CIFAR-10) and achieve good result
-- [ ] improve logging / metrics (e.g. tensorboard) and inference/evaluation code
-- [ ] implement and test v-prediction, and training re-weighting (probably either P2 or Karras). Ideally achieve better result
-- [ ] write training script for a text-to-image latent diffusion model, with text embeddings from Huggingface CLIP models
-- [ ] implement gradient checkpointing and mixed-precision training (possibly including optimizer state)
+- [x] test training code on small-scale (CIFAR-10) and achieve good result
+- [ ] make compatible with diffusers, specifically the samplers, and possibly incorporate their U-Net as well.
+- [ ] improve logging, metrics, and evaluation (probably wandb so that experiment runs can be shared online)
+- [ ] implement everything karras-EDM related and achieve good result
+- [ ] train latent diffusion model on imagenet 256 at f=8
+- [ ] implement gradient checkpointing and mixed-precision training, and any further memory reductions (especially with respect to optimizer state)
+- [ ] work on dataloader for LAION dataset, that might include pre-computed text and/or image embeddings
+- [ ] write training script for a text-to-image latent diffusion model
 
-We use Flax-related things from diffusers for parts of the codebase, so it should be relatively simple to integrate stable diffusion into the training code.
+We adapted the code from the [Progressive distillation](https://github.com/google-research/google-research/tree/master/diffusion_distillation) repo. Hopefully, this code require minimal changes to scale up to more TPU chips as ```jax.pmap``` should handle most of the distribution work for us. The authors of this codebase reportedly trained models on 64 TPU-v4 chips.
