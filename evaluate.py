@@ -10,9 +10,11 @@ from tensorflow.io import gfile, write_file, read_file
 from absl import app, flags
 from ml_collections.config_flags import config_flags
 from checkpoints import latest_checkpoint_path
-from model import Model
+from unet import UNet
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
+import diffusers
+from flax_pipeline import FlaxGeneralDiffusionPipeline
 
 tf_set_visible_devices([], device_type="GPU")
 np.set_printoptions(precision=4)
@@ -67,19 +69,97 @@ def main(_):
     config = args.config
     config.unlock()
 
+    ckpt_path = latest_checkpoint_path(args.checkpoint_dir, prefix='checkpoint_')
+    with gfile.GFile(ckpt_path, 'rb') as fp:
+        restored_sd = flax.serialization.from_bytes(None, fp.read())
+    
+    
+    scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="squaredcos_cap_v2")
+    scheduler_state = scheduler.create_state()
+    #we only support using DDIM, in practice we'd use Pytorch version of diffusers schedulers, a lot more support for those.
+    
+    params = {
+        "unet": restored_sd["ema_params"],
+        "scheduler": scheduler_state
+    }
+    unet = UNet(
+        num_classes=1, out_ch=3, #TODO: put this within the config.
+        **config.model.args
+    )
+
+    devices = jax.devices()
+    print("DEVICES:", devices)
+    params = flax.jax_utils.replicate(params, devices=devices)
+
+    pipe = FlaxGeneralDiffusionPipeline(
+        vae=None, 
+        text_encoder=None, 
+        tokenizer=None, 
+        unet=unet,
+        scheduler=scheduler,
+        safety_checker=None,
+        feature_extractor=None,
+        dtype=jnp.bfloat16,
+        model_config=config.model
+    )
+
+    #TODO: remove magic numbers
+    n_samples_list = [int(n) for n in args.n_samples.split(",")]
+    samples = np.zeros(shape=(0, 32, 32, 3)).astype('uint8')
+    global_rng = jax.random.PRNGKey(0)
+
+    for n_samples in n_samples_list:
+        for n in tqdm(range(0, n_samples, args.max_batch_size)):
+            batch_size = min(args.max_batch_size, n_samples - n)
+            #prompt_ids = [None] * len(devices)
+            global_rng, *rng = jax.random.split(global_rng, jax.device_count() + 1)
+            rng = jax.device_put_sharded(rng, jax.devices())
+
+            per_replica_bs = args.max_batch_size//jax.device_count()
+            prompt_ids = [None] * per_replica_bs
+            current_images = pipe(
+                prompt_ids=prompt_ids,
+                params=params,
+                prng_seed=rng,
+                num_inference_steps=args.n_steps,
+                height=32,
+                width=32,
+                guidance_scale=1.0,
+                jit=True
+            ).block_until_ready()
+
+            current_images = np.array(current_images.reshape(-1, 32, 32, 3))[:batch_size]
+            current_images = np.clip(current_images * 255, 0, 255).astype('uint8')
+            samples = np.concatenate((samples, current_images), axis=0)
+        
+        ext = "png" if args.save_format.lower() == "grid" else "npz"
+        label_string = "uncond"
+
+        samples_identifier = f"{len(gfile.glob(f'{args.save_dir}/*.{ext}'))}_{label_string}"
+        samples_path = os.path.join(args.save_dir, f"samples_{samples_identifier}.{ext}")
+        
+        if args.save_format.lower() == "grid":
+            save_images(samples, samples_path, nrow=args.nrow)
+        else:
+            np.savez("tmpfile.npz", arr0=samples)
+            gfile.copy("tmpfile.npz", samples_path)
+            time.sleep(3.0)
+            gfile.remove("tmpfile.npz")
+
+        print(f"Saved {len(samples)} samples to {samples_path}")
+
+"""
+LEGACY EVALUATOR USING PROGRESSIVE DISTILLATION CODE.
+
+def main(_):
+    config = args.config
+    config.unlock()
+
     model = Model(config)
     ckpt_path = latest_checkpoint_path(args.checkpoint_dir, prefix='checkpoint_')
     with gfile.GFile(ckpt_path, 'rb') as fp:
         restored_sd = flax.serialization.from_bytes(None, fp.read())
     
-
-    """
-    if config.schedule_name == "ddpm":
-        scheduler = diffusers.FlaxDDIMScheduler(**sargs) #flaxpipeline doesnt accept DDPMScheduler as valid scheduler
-    else: 
-        raise NotImplementedError()
-    """
-
     params = {
         "unet": restored_sd["ema_params"],
         #"scheduler": scheduler.create_state()
@@ -126,14 +206,6 @@ def main(_):
         
         ext = "png" if args.save_format.lower() == "grid" else "npz"
         label_string = "uncond"
-        """
-        if model.num_classes == 0 or args.label == model.num_classes:
-            label_string = "uncond"
-        elif args.label == -1:
-            label_string = "random_classes_m{args.mean_scale}_v{args.var_scale}"
-        else:
-            label_string = f"class_{str(args.label)}_m{args.mean_scale}_v{args.var_scale}"
-        """
 
         samples_identifier = f"{len(gfile.glob(f'{args.save_dir}/*.{ext}'))}_{label_string}"
         samples_path = os.path.join(args.save_dir, f"samples_{samples_identifier}.{ext}")
@@ -147,6 +219,7 @@ def main(_):
             gfile.remove("tmpfile.npz")
 
         print(f"Saved {len(samples)} samples to {samples_path}")
+"""
 
 if __name__ == '__main__':
     app.run(main)

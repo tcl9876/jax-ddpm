@@ -6,3 +6,5 @@ pillow
 flax==0.5.3
 ml_collections
 clu
+diffusers==0.7.0
+transformers
