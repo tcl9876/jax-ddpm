@@ -26,6 +26,9 @@ import jax.numpy as jnp
 import numpy as onp
 import PIL
 
+def unreplicate(x):
+    return jax.device_get(flax.jax_utils.unreplicate(x))
+
 
 def normalize_data(x):
 	return x / 127.5 - 1.
@@ -215,76 +218,6 @@ def flatten(x):
 	return x.reshape(x.shape[0], -1)
 
 
-def reverse_fori_loop(lower, upper, body_fun, init_val):
-	"""Loop from upper-1 to lower."""
-	if isinstance(lower, int) and isinstance(upper, int) and lower >= upper:
-		raise ValueError('Expected lower < upper')
-
-	def reverse_body_fun(i, val):
-		return body_fun(upper + lower - 1 - i, val)
-
-	return jax.lax.fori_loop(lower, upper, reverse_body_fun, init_val)
-
-
-def normal_kl(mean1, logvar1, mean2, logvar2):
-	"""KL divergence between normal distributions.
-
-	Distributions parameterized by mean and log variance.
-
-	Args:
-		mean1: mean of the first distribution
-		logvar1: log variance of the first distribution
-		mean2: mean of the second distribution
-		logvar2: log variance of the second distribution
-
-	Returns:
-		KL(N(mean1, exp(logvar1)) || N(mean2, exp(logvar2)))
-	"""
-	return 0.5 * (-1.0 + logvar2 - logvar1 + jnp.exp(logvar1 - logvar2)
-								+ jnp.square(mean1 - mean2) * jnp.exp(-logvar2))
-
-
-def approx_normal_cdf(x):
-	return 0.5 * (1.0 + jnp.tanh(
-			onp.sqrt(2.0 / onp.pi) * (x + 0.044715 * jnp.power(x, 3))))
-
-
-def normal_cdf(x):
-	return 0.5 * (1.0 + jax.lax.erf(x * (2.0 ** -0.5)))
-
-
-def discretized_gaussian_log_likelihood(x, *, means, log_scales):
-	"""Log likelihood of a discretized Gaussian specialized for image data.
-
-	Assumes data `x` consists of integers [0, 255] rescaled to [-1, 1].
-
-	Args:
-		x: where to evaluate the distribution
-		means: the means of the distribution
-		log_scales: log standard deviations (WARNING: not the log variance).
-
-	Returns:
-		log likelihoods
-	"""
-	assert x.shape == means.shape == log_scales.shape
-
-	centered_x = x - means
-	inv_stdv = jnp.exp(-log_scales)
-	cdf_plus = normal_cdf(inv_stdv * (centered_x + 1. / 255.))
-	cdf_min = normal_cdf(inv_stdv * (centered_x - 1. / 255.))
-
-	def safe_log(z):
-		return jnp.log(jnp.maximum(z, 1e-12))
-
-	log_cdf_plus = safe_log(cdf_plus)
-	log_one_minus_cdf_min = safe_log(1. - cdf_min)
-	log_cdf_delta = safe_log(cdf_plus - cdf_min)
-	log_probs = jnp.where(
-			x < -0.999, log_cdf_plus,
-			jnp.where(x > 0.999, log_one_minus_cdf_min, log_cdf_delta))
-	assert log_probs.shape == x.shape
-	return log_probs
-
 
 def count_params(pytree):
 	return sum([x.size for x in jax.tree_leaves(pytree)])
@@ -350,46 +283,9 @@ class RngGen(object):
 def jax_randint(key, minval=0, maxval=2**20):
 	return int(jax.random.randint(key, shape=(), minval=minval, maxval=maxval))
 
-class CosineDecay:
-    def __init__(self, startlr, maxlr, minlr, warmup_steps, decay_steps):
-        self.startlr = startlr
-        self.maxlr = maxlr
-        self.minlr = minlr
-        self.warmup_steps = warmup_steps
-        self.decay_steps = decay_steps
-        
-    def __call__(self, step):
-        step = jnp.minimum(step, self.decay_steps)
-        startlr, maxlr, minlr = self.startlr, self.maxlr, self.minlr
-        warmup = startlr + step/self.warmup_steps * (maxlr - startlr)
-
-        decay_factor = 0.5 * (1 + jnp.cos(jnp.pi * step/self.decay_steps))
-        decay_factor = (1 - minlr/maxlr) * decay_factor + minlr/maxlr
-        lr = maxlr * decay_factor
-        return jnp.minimum(warmup, lr)
-
-@jax.custom_jvp
-def log1mexp(x):
-	"""Accurate computation of log(1 - exp(-x)) for x > 0."""
-	# From James Townsend's PixelCNN++ code
-	# Method from
-	# https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
-	return jnp.where(x > jnp.log(2), jnp.log1p(-jnp.exp(-x)),
-									 jnp.log(-jnp.expm1(-x)))
-
-
-# log1mexp produces NAN gradients for small inputs because the derivative of the
-# log1p(-exp(-eps)) branch has a zero divisor (1 + -jnp.exp(-eps)), and NANs in
-# the derivative of one branch of a where cause NANs in the where's vjp, even
-# when the NAN branch is not taken. See
-# https://github.com/google/jax/issues/1052. We work around this by defining a
-# custom jvp.
-log1mexp.defjvps(lambda t, _, x: t / jnp.expm1(x))
-
 
 def broadcast_from_left(x, shape):
 	assert len(shape) >= x.ndim
 	return jnp.broadcast_to(
 			x.reshape(x.shape + (1,) * (len(shape) - x.ndim)),
 			shape)
-

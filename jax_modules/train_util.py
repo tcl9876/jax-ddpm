@@ -22,20 +22,18 @@
 
 
 import functools
-from typing import Any, Dict, Union
+from typing import Any
 
-import checkpoints
-import datasets
-import dpm
-import schedules
-import unet
-import utils
+from datasets import datasets
+from diffusion.dpm import DiffusionWrapper
+from diffusion.schedules import get_logsnr_schedule
+from .unet import UNet
+from . import utils
+from .optimizer import make_optimizer
 from absl import logging
 import flax
 import jax
 import jax.numpy as jnp
-import ml_collections
-import numpy as onp
 import optax
 
 
@@ -48,7 +46,7 @@ class TrainState:
 	num_sample_steps: int
 
 
-class Model:
+class Trainer:
 	"""Diffusion model."""
 
 	def __init__(self, config, dataset=None):
@@ -70,7 +68,7 @@ class Model:
 		if 'learned' in config.model.logvar_type:
 			out_ch += x_ch
 
-		self.model = unet.UNet(
+		self.model = UNet(
 			num_classes=self.dataset.num_classes,
 			out_ch=out_ch,
 			**config.model.args)
@@ -99,7 +97,7 @@ class Model:
 			utils.count_params(init_params)))
 
 		# Make the optimizer
-		self.tx = self.make_optimizer()
+		self.tx = make_optimizer(self.config)
 		optimizer_state = self.tx.init(init_params)
 
 		# For ema_params below, copy so that pmap buffer donation doesn't donate the
@@ -136,7 +134,7 @@ class Model:
 
 		logging.info(
 			f'train_logsnr_schedule: {self.config.model.train_logsnr_schedule}')
-		model = dpm.Model(
+		model = DiffusionWrapper(
 			model_fn=model_fn,
 			target_model_fn=target_model_fn,
 			mean_type=self.config.model.mean_type,
@@ -145,7 +143,7 @@ class Model:
 		loss_dict = model.training_losses(
 			x=img,
 			rng=next(rng),
-			logsnr_schedule_fn=schedules.get_logsnr_schedule(
+			logsnr_schedule_fn=get_logsnr_schedule(
 				**self.config.model.train_logsnr_schedule),
 			num_steps=self.current_num_steps,
 			mean_loss_weight_type=self.config.model.mean_loss_weight_type)
@@ -154,8 +152,7 @@ class Model:
 		loss_dict = {k: v.mean() for (k, v) in loss_dict.items()}
 		return loss_dict['loss'], loss_dict
 
-	def step_fn(self, base_rng, train, state,
-				batch, learning_rate_mult=1.):
+	def step_fn(self, base_rng, train, state, batch):
 		"""One training/eval step."""
 		config = self.config
 
@@ -207,20 +204,6 @@ class Model:
 				optimizer_state=new_opt_state,
 				ema_params=new_ema_params)
 			
-			"""
-			#TODO: perhaps implement gradient skipping based on gradient norm value.
-
-			if config.train.get('enable_update_skip', True):
-				# Apply update if the new optimizer state is all finite
-				ok = jnp.all(jnp.asarray([
-					jnp.all(jnp.isfinite(p)) for p in jax.tree_leaves(new_params)]))
-				new_state_no_update = state.replace(step=step + 1)
-				state = jax.tree_map(
-					lambda a, b: jnp.where(ok, a, b), new_state, new_state_no_update)
-			else:
-				logging.info('Update skipping disabled')
-				state = new_state
-			"""
 		else:
 		# Eval mode with EMA params
 			_, metrics = loss_fn(state.ema_params)
@@ -233,79 +216,39 @@ class Model:
 		}
 		return (state, metrics) if train else metrics
 
-	def samples_fn(self,
-					*,
-					rng,
-					params,
-					labels=None,
-					batch=None,
-					num_steps=None,
-					num_samples=8):
-		"""Sample from the model."""
-		rng = utils.RngGen(rng)
-		if labels is not None:
-			y = labels
-		elif batch is not None:
-			y = batch.get('label', None)
-		else:
-			y = None
-		if y is not None:
-			num_samples = len(y)
-		if batch is not None and 'image' in batch:
-			dummy_x = batch['image']
-		else:
-			dummy_x = jnp.zeros((num_samples, *self.dataset.data_shape),
-							dtype=jnp.float32)
-
-		model_fn = lambda x, logsnr: self.model.apply(
-			{'params': params}, x=x, logsnr=logsnr, y=y, train=False)
-
-		if num_steps is None:
-			num_steps = self.config.model.eval_sampling_num_steps
-		logging.info(
-			f'eval_sampling_num_steps: {num_steps}'
-		)
-		logging.info(
-			f'eval_logsnr_schedule: {self.config.model.eval_logsnr_schedule}')
-
-		init_x = jax.random.normal(
-			next(rng), shape=dummy_x.shape, dtype=dummy_x.dtype)
-
-		model = dpm.Model(
-			model_fn=model_fn,
-			mean_type=self.config.model.mean_type,
-			logvar_type=self.config.model.logvar_type,
-			logvar_coeff=self.config.model.get('logvar_coeff', 0.))
-		samples = model.sample_loop(
-			rng=next(rng),
-			init_x=init_x,
-			num_steps=num_steps,
-			logsnr_schedule_fn=schedules.get_logsnr_schedule(
-				**self.config.model.eval_logsnr_schedule),
-			sampler=self.config.sampler,
-			clip_x=self.config.model.eval_clip_denoised)
-
-		unnormalized_samples = samples #jnp.clip(utils.unnormalize_data(samples), 0, 255)
-		assert unnormalized_samples.shape == dummy_x.shape
-		return unnormalized_samples
-
-	def make_optimizer(self):
-		"""Make the optimizer."""
-		config = self.config
-
-		optimizer_kwargs = {}
-		if config.train.weight_decay > 0.:
-			optimizer_kwargs['weight_decay'] = config.train.weight_decay
-
-		learning_rate = utils.CosineDecay(0.0, config.train.learning_rate, config.train.learning_rate, 1000, 1000000)
-		if config.train.optimizer == 'adam' or config.train.optimizer == 'adamw':
-			optimizer = optax.adamw(
-				**optimizer_kwargs,
-				b1=config.train.get('adam_beta1', 0.9),
-				b2=config.train.get('adam_beta2', 0.999),
-				learning_rate=learning_rate)
-		else:
-			raise NotImplementedError()
-
-		return optimizer
-
+class MeanObject(object):
+    def __init__(self):
+        self.reset_states()
+    
+    def __repr__(self):
+        return repr(self._mean)
+     
+    def reset_states(self):
+        self._mean = 0.
+        self._count = 0
+        
+    def update(self, new_entry):
+        assert isinstance(new_entry, float)# or L.shape == () #what is L? commenting out.
+        self._count = self._count + 1
+        self._mean = (1-1/self._count)*self._mean + new_entry/self._count
+        
+    def result(self):
+        return self._mean
+        
+class Metrics(object):
+    def __init__(self, metric_names):
+        self.names = metric_names
+        self._metric_dict = {
+            name: MeanObject() for name in self.names
+        }
+    
+    def __repr__(self):
+        return repr(self._metric_dict)
+    
+    def update(self, new_metrics):
+        for name in self.names:
+            self._metric_dict[name].update(new_metrics[name])
+        
+    def reset_states(self):
+        for name in self.names:
+            self._metric_dict[name].reset_states()

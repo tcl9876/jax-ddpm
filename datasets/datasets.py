@@ -30,7 +30,7 @@ When data augmentation is enabled, nondeterministic behavior is expected.
 import functools
 from typing import Any, Mapping, Optional, Tuple
 
-import utils
+from jax_modules import utils
 from absl import logging
 from clu import deterministic_data
 import tensorflow.compat.v2 as tf

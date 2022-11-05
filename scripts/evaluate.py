@@ -9,8 +9,8 @@ from tensorflow.config import set_visible_devices as tf_set_visible_devices
 from tensorflow.io import gfile, write_file, read_file
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-from checkpoints import latest_checkpoint_path
-from unet import UNet
+from jax_modules.checkpoints import restore_checkpoint
+from jax_modules.unet import UNet
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 import diffusers
@@ -69,15 +69,13 @@ def main(_):
     config = args.config
     config.unlock()
 
-    ckpt_path = latest_checkpoint_path(args.checkpoint_dir, prefix='checkpoint_')
-    with gfile.GFile(ckpt_path, 'rb') as fp:
-        restored_sd = flax.serialization.from_bytes(None, fp.read())
-    
-    
     scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="squaredcos_cap_v2")
     scheduler_state = scheduler.create_state()
     #we only support using DDIM, in practice we'd use Pytorch version of diffusers schedulers, a lot more support for those.
     
+    restored_sd = restore_checkpoint(args.checkpoint_dir, None) #restore the checkpoint as a dict.
+    del restored_sd["optimizer_state"]
+    print(f"Restored Checkpoint from {restored_sd.step} steps")
     params = {
         "unet": restored_sd["ema_params"],
         "scheduler": scheduler_state

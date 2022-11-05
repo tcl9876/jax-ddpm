@@ -2,27 +2,19 @@ import os
 import time
 import functools
 import jax
-import jax.numpy as jnp
 import flax
-from matplotlib import pyplot as plt
-import numpy as onp
-import tensorflow.compat.v2 as tf
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-from model import Model
-from checkpoints import save_checkpoint
-from utils import numpy_iter
-tf.enable_v2_behavior()
-from tensorflow.io import gfile
+from jax_modules.train_util import Trainer, Metrics
+from jax_modules.checkpoints import save_checkpoint, restore_checkpoint
+from jax_modules.utils import numpy_iter, unreplicate
+from tensorflow.io import gfile, write_file
 
 args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
 flags.DEFINE_string("global_dir", None, "the global directory you will save all training stuff into.")
 flags.DEFINE_string("data_dir", None, "the directory where your data is stored (or where it will be downloaded into).")
 flags.mark_flags_as_required(["config", "global_dir"])
-
-def unreplicate(x):
-    return jax.device_get(flax.jax_utils.unreplicate(x))
 
 def print_and_log(*args, logfile_path):
     print(*args)
@@ -33,42 +25,6 @@ def print_and_log(*args, logfile_path):
     with gfile.GFile(logfile_path, mode='a') as f:
         f.write('\n')
 
-class MeanObject(object):
-    def __init__(self):
-        self.reset_states()
-    
-    def __repr__(self):
-        return repr(self._mean)
-     
-    def reset_states(self):
-        self._mean = 0.
-        self._count = 0
-        
-    def update(self, new_entry):
-        assert isinstance(new_entry, float)# or L.shape == () #what is L? commenting out.
-        self._count = self._count + 1
-        self._mean = (1-1/self._count)*self._mean + new_entry/self._count
-        
-    def result(self):
-        return self._mean
-        
-class Metrics(object):
-    def __init__(self, metric_names):
-        self.names = metric_names
-        self._metric_dict = {
-            name: MeanObject() for name in self.names
-        }
-    
-    def __repr__(self):
-        return repr(self._metric_dict)
-    
-    def update(self, new_metrics):
-        for name in self.names:
-            self._metric_dict[name].update(new_metrics[name])
-        
-    def reset_states(self):
-        for name in self.names:
-            self._metric_dict[name].reset_states()
 
 def main(_):
     config, global_dir = args.config, args.global_dir
@@ -84,21 +40,23 @@ def main(_):
     
     logfile_path = os.path.join(targs.log_dir, 'logfile.txt')
     if not gfile.exists(logfile_path):
-        tf.io.write_file(logfile_path, "")
+        write_file(logfile_path, "")
     printl = functools.partial(print_and_log, logfile_path=logfile_path)
 
     #TODO: add checkpoint restoration.
-    model = Model(config)
-    state = jax.device_get(model.make_init_state())
+    trainer = Trainer(config)
+    state = jax.device_get(trainer.make_init_state())
+    state = restore_checkpoint(targs.checkpoint_dirs[0], state)
+    print(f"Current iteration after restore: {state.step}")
     state = flax.jax_utils.replicate(state)
 
-    train_step = functools.partial(model.step_fn, jax.random.PRNGKey(0), True)
+    train_step = functools.partial(trainer.step_fn, jax.random.PRNGKey(0), True)
     train_step = functools.partial(jax.lax.scan, train_step)  # for substeps
     train_step = jax.pmap(train_step, axis_name='batch', donate_argnums=(0,))
 
     total_bs = config.train.batch_size
     device_bs = total_bs // jax.device_count()
-    train_ds = model.dataset.get_shuffled_repeated_dataset(
+    train_ds = trainer.dataset.get_shuffled_repeated_dataset(
         split='train',
         batch_shape=(
             jax.local_device_count(),  # for pmap
@@ -111,7 +69,8 @@ def main(_):
 
     s = time.time()
     metrics = Metrics(["train/gnorm", "train/loss"])
-    for global_step in range(20001):
+
+    for global_step in range(unreplicate(state.step), targs.iterations + targs.substeps, targs.substeps):
         batch = next(train_iter)
         state, new_metrics = train_step(state, batch)
         if global_step%2==0 or global_step < 100:

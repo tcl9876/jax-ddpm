@@ -27,7 +27,7 @@ import re
 import time
 from absl import logging
 from flax import serialization
-from tensorflow.compat.v2.io import gfile
+from tensorflow.io import gfile
 
 
 # Single-group reg-exps for int or float numerical substrings.
@@ -69,11 +69,11 @@ def natural_sort(file_list, signed=True):
 
 
 def save_checkpoint(ckpt_dir,
-										target,
-										step,
-										prefix='checkpoint_',
-										keep=1,
-										overwrite=False):
+					target,
+					step,
+					prefix='checkpoint_',
+					keep=1,
+					overwrite=False):
 	"""Save a checkpoint of the model.
 
 	Attempts to be pre-emption safe by writing to temporary before
@@ -151,41 +151,31 @@ def restore_from_path(ckpt_path, target):
 
 
 def restore_checkpoint(ckpt_dir, target, step=None, prefix='checkpoint_'):
-	"""Restore last/best checkpoint from checkpoints in path.
-
-	Sorts the checkpoint files naturally, returning the highest-valued
-	file, e.g.:
-		ckpt_1, ckpt_2, ckpt_3 --> ckpt_3
-		ckpt_0.01, ckpt_0.1, ckpt_0.001 --> ckpt_0.1
-		ckpt_-1.0, ckpt_1.0, ckpt_1e5 --> ckpt_1e5
-
-	Args:
-		ckpt_dir: str: directory of checkpoints to restore from.
-		target: matching object to rebuild via deserialized state-dict.
-		step: int: step number to load or None to load latest.
-		prefix: str: name prefix of checkpoint files.
-
-	Returns:
-		Restored `target` updated from checkpoint file, or if no step specified and
-		no checkpoint files present, returns the passed-in `target` unchanged.
-	"""
 	if step:
 		ckpt_path = _checkpoint_path(ckpt_dir, step, prefix)
 		if not gfile.exists(ckpt_path):
 			raise ValueError(f'Matching checkpoint not found: {ckpt_path}')
+		else:
+			print(f"Attempting to restore checkpoint from {ckpt_path}")
+		return restore_from_path(ckpt_path, target)
 	else:
-		ckpt_path = latest_checkpoint_path(ckpt_dir, prefix)
-		if ckpt_path is None:
+		ckpt_path = latest_checkpoint_path(ckpt_dir, prefix=prefix)
+		if ckpt_path is not None:
+			print(f"Attempting to restore checkpoint from {ckpt_path}")
+			with gfile.GFile(ckpt_path, 'rb') as fp:
+				restored_state = serialization.from_bytes(target, fp.read())
+			return restored_state
+		else:
+			print(f"No checkpoint found in {ckpt_dir}. Restoring original state.")
 			return target
-
-	return restore_from_path(ckpt_path, target)
+			
 
 
 def wait_for_new_checkpoint(ckpt_dir,
-														last_ckpt_path=None,
-														seconds_to_sleep=1,
-														timeout=None,
-														prefix='checkpoint_'):
+							last_ckpt_path=None,
+							seconds_to_sleep=1,
+							timeout=None,
+							prefix='checkpoint_'):
 	"""Waits until a new checkpoint file is found.
 
 	Args:
@@ -215,10 +205,10 @@ def wait_for_new_checkpoint(ckpt_dir,
 
 
 def checkpoints_iterator(ckpt_dir,
-												 target,
-												 timeout=None,
-												 min_interval_secs=0,
-												 prefix='checkpoint_'):
+						target,
+						timeout=None,
+						min_interval_secs=0,
+						prefix='checkpoint_'):
 	"""Repeatedly yield new checkpoints as they appear.
 
 	Args:

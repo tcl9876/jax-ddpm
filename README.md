@@ -13,6 +13,8 @@ then clone this repository and navigate into it. Run the following:
 
 `` pip install -r requirements.txt ``
 
+``pip install -e .``
+
 ``python3 train.py --config config/expm1_config.py --global_dir "gs://bucket_name"``
 
 For now, our training checkpoints and logs are publicly available at gs://jax-ddpm-training
