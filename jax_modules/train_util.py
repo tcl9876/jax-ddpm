@@ -236,19 +236,25 @@ class MeanObject(object):
         return self._mean
         
 class Metrics(object):
-    def __init__(self, metric_names):
-        self.names = metric_names
-        self._metric_dict = {
-            name: MeanObject() for name in self.names
-        }
-    
-    def __repr__(self):
-        return repr(self._metric_dict)
-    
-    def update(self, new_metrics):
-        for name in self.names:
-            self._metric_dict[name].update(new_metrics[name])
-        
-    def reset_states(self):
-        for name in self.names:
-            self._metric_dict[name].reset_states()
+	def __init__(self, metric_names):
+		self.names = metric_names
+		self._metric_dict = {
+			name: MeanObject() for name in self.names
+		}
+
+	def to_dict(self):
+		out_dict = {}
+		for k, v in self._metric_dict.items():
+			out_dict[k] = float(v._mean)
+		return out_dict
+		
+	def __repr__(self):
+		return repr(self._metric_dict)
+
+	def update(self, new_metrics):
+		for name in self.names:
+			self._metric_dict[name].update(new_metrics[name])
+		
+	def reset_states(self):
+		for name in self.names:
+			self._metric_dict[name].reset_states()

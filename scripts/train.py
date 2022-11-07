@@ -9,22 +9,27 @@ from jax_modules.train_util import Trainer, Metrics
 from jax_modules.checkpoints import save_checkpoint, restore_checkpoint
 from jax_modules.utils import numpy_iter, unreplicate
 from tensorflow.io import gfile, write_file
+import wandb
 
 args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
 flags.DEFINE_string("global_dir", None, "the global directory you will save all training stuff into.")
 flags.DEFINE_string("data_dir", None, "the directory where your data is stored (or where it will be downloaded into).")
+flags.DEFINE_string("wandb_project", None, "if you are using wandb to manage experiments, the project name.")
+flags.DEFINE_string("wandb_run", None, "if you are using wandb to manage experiments, the experiment run name.")
 flags.mark_flags_as_required(["config", "global_dir"])
 
-def print_and_log(*args, logfile_path):
-    print(*args)
-    for a in args:
-        with gfile.GFile(logfile_path, mode='a') as f:
-            f.write(str(a))
-
+def print_and_log_dict(logfile_path, kwargs):
+    #print and log a dict of kwargs.
+    metric_dict = kwargs.pop("metrics")
+    wandb.log(metric_dict.to_dict())
+    wandb.log(kwargs)
+    printed_string = ""
+    for k, v in kwargs.items():
+        printed_string += f"{k}: {v}, "
+    print(printed_string[:-2])
     with gfile.GFile(logfile_path, mode='a') as f:
-        f.write('\n')
-
+        f.write(printed_string[:-2] + '\n')
 
 def main(_):
     config, global_dir = args.config, args.global_dir
@@ -38,10 +43,20 @@ def main(_):
     targs.checkpoint_dirs = [subdir.format(global_dir) for subdir in targs.checkpoint_dirs]
     targs.log_dir = targs.log_dir.format(global_dir)
     
+    use_wandb = args.wandb_project is not None
+    if use_wandb:
+        wandb.login()
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run,
+            config=config.to_dict(), 
+            resume=True
+        )
+
     logfile_path = os.path.join(targs.log_dir, 'logfile.txt')
     if not gfile.exists(logfile_path):
         write_file(logfile_path, "")
-    printl = functools.partial(print_and_log, logfile_path=logfile_path)
+    #print_and_log = functools.partial(print_and_log_dict, logfile_path=logfile_path)
 
     #TODO: add checkpoint restoration.
     trainer = Trainer(config)
@@ -79,14 +94,21 @@ def main(_):
             metrics.update(new_metrics)
 
         if global_step % targs.log_loss_every_steps==0 or global_step < 100: 
-            printl(f'Real Step: {unreplicate(state.step)}, Batches passed this session: {global_step},  Metrics: {metrics}, Time {round(time.time()-s)}s')
+            real_step = unreplicate(state.step)
+            kwargs = {
+                "real step": real_step,
+                "total images seen": real_step * targs.batch_size,
+                "metrics": metrics,
+                "seconds elapsed": round(time.time()-s)
+            }
+            print_and_log_dict(logfile_path, kwargs)
             metrics.reset_states()
         
         for checkpoint_dir, num_checkpoints, save_freq in zip(targs.checkpoint_dirs, targs.num_checkpoints, targs.save_freq):
             if global_step%save_freq==0:
                 unreplicated_state = unreplicate(state)
                 save_checkpoint(checkpoint_dir, unreplicated_state, keep=num_checkpoints, step=unreplicated_state.step)
-    
+        
 
 if __name__ == '__main__':
     app.run(main)

@@ -25,6 +25,8 @@ import jax
 import jax.numpy as jnp
 import numpy as onp
 import PIL
+from tensorflow.io import gfile
+import time
 
 def unreplicate(x):
     return jax.device_get(flax.jax_utils.unreplicate(x))
@@ -101,7 +103,7 @@ def np_tile_imgs(imgs, *, pad_pixels=1, pad_val=255, num_col=0):
 	imgs = onp.pad(
 			imgs,
 			pad_width=((0, num_row * num_col - n), (pad_pixels, pad_pixels),
-								 (pad_pixels, pad_pixels), (0, 0)),
+						(pad_pixels, pad_pixels), (0, 0)),
 			mode='constant',
 			constant_values=pad_val
 	)
@@ -118,10 +120,25 @@ def np_tile_imgs(imgs, *, pad_pixels=1, pad_val=255, num_col=0):
 
 
 def save_tiled_imgs(filename, imgs, pad_pixels=1, pad_val=255, num_col=0):
-	PIL.Image.fromarray(
-			np_tile_imgs(
+	#creates a grid of images and saves them to a file. also returns the created PIL image.
+	imgs_grid = np_tile_imgs(
 					imgs, pad_pixels=pad_pixels, pad_val=pad_val,
-					num_col=num_col)).save(filename)
+					num_col=num_col)
+
+	if not (filename.startswith("gs://") or filename.startswith("gcs://")):
+		image = PIL.Image.fromarray(imgs_grid)
+		image.save(filename)
+	else:
+		#save a temporary version locally, then move to GCS remote storage, then delete the local copy.
+		image = PIL.Image.fromarray(imgs_grid)
+		image.save("./tmp_figure.png")
+		gfile.copy("./tmp_figure.png", filename)
+		time.sleep(1.5)
+		gfile.remove("./tmp_figure.png")
+
+	return image
+
+
 
 
 @functools.partial(jax.pmap, axis_name='batch')
@@ -199,7 +216,7 @@ def tf_to_numpy(tf_batch):
 	"""TF to NumPy, using ._numpy() to avoid copy."""
 	# pylint: disable=protected-access,g-long-lambda
 	return jax.tree_map(lambda x: (x._numpy()
-																 if hasattr(x, '_numpy') else x), tf_batch)
+						if hasattr(x, '_numpy') else x), tf_batch)
 
 
 def numpy_iter(tf_dataset):
