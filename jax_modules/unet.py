@@ -115,6 +115,15 @@ class ResnetBlock(nn.Module):
 				self.name, x.shape, emb.shape, self.resample)
 		return x + h
 
+#the astype's is a workaround for now, when switching to HF Unet, will use full mixed-precision training.
+@jax.checkpoint
+def lowmem_dot_product_attention(q, k, v):
+	#TODO: convert to a jax.lax.fori_loop over the heads, possibly over the batch axis instead/as well for 64^2
+	q, k, v = q.astype(jnp.bfloat16), k.astype(jnp.bfloat16), v.astype(jnp.bfloat16)
+	half = q.shape[2]//2
+	h1 = nn.dot_product_attention(q[:, :, :half, :], k[:, :, :half, :], v[:, :, :half, :])
+	h2 = nn.dot_product_attention(q[:, :, half:, :], k[:, :, half:, :], v[:, :, half:, :])
+	return jnp.concatenate((h1, h2), axis=2).astype(jnp.float32)
 
 class AttnBlock(nn.Module):
 	"""Self-attention residual block."""
@@ -145,7 +154,7 @@ class AttnBlock(nn.Module):
 		k = nn.DenseGeneral(features=(num_heads, head_dim), name='k')(h)
 		v = nn.DenseGeneral(features=(num_heads, head_dim), name='v')(h)
 		assert q.shape == k.shape == v.shape == (B, H * W, num_heads, head_dim)
-		h = nn.dot_product_attention(query=q, key=k, value=v)
+		h = lowmem_dot_product_attention(q, k, v)
 		assert h.shape == (B, H * W, num_heads, head_dim)
 		h = nn.DenseGeneral(
 				features=C,

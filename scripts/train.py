@@ -27,9 +27,11 @@ def print_and_log_dict(logfile_path, kwargs):
     printed_string = ""
     for k, v in kwargs.items():
         printed_string += f"{k}: {v}, "
-    print(printed_string[:-2])
+    
+    fstr = f"{printed_string[:-2]}, metrics: {repr(metric_dict)}"
+    print(fstr)
     with gfile.GFile(logfile_path, mode='a') as f:
-        f.write(printed_string[:-2] + '\n')
+        f.write(fstr + '\n')
 
 def main(_):
     config, global_dir = args.config, args.global_dir
@@ -79,7 +81,8 @@ def main(_):
             device_bs,  # batch size per device
         ),
         local_rng=jax.random.PRNGKey(0),
-        augment=True)
+        augment=True,
+        data_dir=args.data_dir)
     train_iter = numpy_iter(train_ds)
 
     s = time.time()
@@ -88,12 +91,12 @@ def main(_):
     for global_step in range(unreplicate(state.step), targs.iterations + targs.substeps, targs.substeps):
         batch = next(train_iter)
         state, new_metrics = train_step(state, batch)
-        if global_step%2==0 or global_step < 100:
+        if global_step%2==0:
             new_metrics = unreplicate(new_metrics)
             new_metrics = jax.tree_map(lambda x: float(x.mean()), new_metrics)
             metrics.update(new_metrics)
 
-        if global_step % targs.log_loss_every_steps==0 or global_step < 100: 
+        if global_step % targs.log_loss_every_steps==0 and global_step > targs.substeps: 
             real_step = unreplicate(state.step)
             kwargs = {
                 "real step": real_step,

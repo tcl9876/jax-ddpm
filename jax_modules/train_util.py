@@ -61,16 +61,17 @@ class Trainer:
 		self._eval_step = None
 
 		# infer number of output channels for UNet
+		"""
 		x_ch = self.dataset.data_shape[-1]
-		out_ch = x_ch
+		out_ch = config.model.out_ch
 		if config.model.mean_type == 'both':
 			out_ch += x_ch
 		if 'learned' in config.model.logvar_type:
 			out_ch += x_ch
+		"""
 
 		self.model = UNet(
 			num_classes=self.dataset.num_classes,
-			out_ch=out_ch,
 			**config.model.args)
 
 	@property
@@ -124,6 +125,11 @@ class Trainer:
 		if label is not None:
 			assert label.shape == (img.shape[0],)
 			assert label.dtype == jnp.int32
+		
+		#drop randomly for CFG
+		uncond_label = jnp.full_like(label, self.model.num_classes)
+		mask = jnp.greater(jax.random.uniform(next(rng), label.shape), 0.9).astype(jnp.int32)
+		label = label*(1-mask) + mask*uncond_label
 
 		def model_fn(x, logsnr):
 			return self.model.apply(
@@ -139,7 +145,8 @@ class Trainer:
 			target_model_fn=target_model_fn,
 			mean_type=self.config.model.mean_type,
 			logvar_type=self.config.model.logvar_type,
-			logvar_coeff=self.config.model.get('logvar_coeff', 0.))
+			logvar_coeff=self.config.model.get('logvar_coeff', 0.),
+			loss_scale=self.config.model.get('loss_scale', 1.))
 		loss_dict = model.training_losses(
 			x=img,
 			rng=next(rng),
@@ -171,7 +178,7 @@ class Trainer:
 
 			# Average grad across shards
 			grad, metrics['gnorm'] = utils.clip_by_global_norm(
-				grad, clip_norm=1.0)
+				grad, clip_norm=config.train.grad_clip)
 			grad = jax.lax.pmean(grad, axis_name='batch')
 
 			# Update optimizer and EMA params

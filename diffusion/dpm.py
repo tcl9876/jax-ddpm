@@ -82,12 +82,13 @@ def predict_v_from_x_and_eps(*, x, eps, logsnr):
 class DiffusionWrapper:
 
 	def __init__(self, model_fn, *, mean_type, logvar_type, logvar_coeff,
-							 target_model_fn=None):
+							 target_model_fn=None, loss_scale=1.0):
 		self.model_fn = model_fn
 		self.mean_type = mean_type
 		self.logvar_type = logvar_type
 		self.logvar_coeff = logvar_coeff
 		self.target_model_fn = target_model_fn
+		self.loss_scale = loss_scale
 
 	def _run_model(self, *, z, logsnr, model_fn, clip_x):
 		model_output = model_fn(z, logsnr)
@@ -164,11 +165,21 @@ class DiffusionWrapper:
 		# denoising loss
 		model_output = self._run_model(
 				z=z, logsnr=logsnr, model_fn=self.model_fn, clip_x=False)
+
 		x_mse = utils.meanflat(jnp.square(model_output['model_x'] - x_target))
 		eps_mse = utils.meanflat(jnp.square(model_output['model_eps'] - eps_target))
 		v_mse = utils.meanflat(jnp.square(model_output['model_v'] - v_target))
 		
-		if mean_loss_weight_type == 'constant':  # constant weight on x_mse
+		if mean_loss_weight_type == 'p2':
+			#p2 weighting with gamma = 1
+			assert logsnr.shape == eps_mse.shape
+			reweighting_factor = 1 / (1 + jnp.exp(logsnr))
+			loss = eps_mse * reweighting_factor
+		elif reweighting_factor == 'p2_half':
+			#p2 with gamma = 0.5. This might be better as its in the latent space where imperceptible information has been removed already.
+			reweighting_factor = 1 / jnp.sqrt(1 + jnp.exp(logsnr))
+			loss = eps_mse * reweighting_factor
+		elif mean_loss_weight_type == 'constant':  # constant weight on x_mse
 			loss = x_mse
 		elif mean_loss_weight_type == 'snr':  # SNR * x_mse = eps_mse
 			loss = eps_mse
@@ -178,4 +189,6 @@ class DiffusionWrapper:
 			loss = v_mse
 		else:
 			raise NotImplementedError(mean_loss_weight_type)
+		
+		loss = loss * self.loss_scale
 		return {'loss': loss}

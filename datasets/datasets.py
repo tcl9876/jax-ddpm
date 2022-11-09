@@ -35,6 +35,8 @@ from absl import logging
 from clu import deterministic_data
 import tensorflow.compat.v2 as tf
 import tensorflow_datasets as tfds
+import os
+import random as python_random
 
 
 def batch_dataset(dataset, batch_shape):
@@ -78,7 +80,7 @@ class Dataset:
 		return 50000
 
 	def get_shuffled_repeated_dataset(self, *, batch_shape,
-																		split, local_rng, augment):
+									split, local_rng, augment, data_dir=None):
 		"""Shuffled and repeated dataset suitable for training.
 
 		Shuffling is determined by local_rng, which should be different for
@@ -95,7 +97,7 @@ class Dataset:
 		"""
 		local_rng = utils.RngGen(local_rng)
 		ds = self._load_tfds(  # file-level shuffling here
-				split=split, shuffle_seed=utils.jax_randint(next(local_rng)))
+				split=split, shuffle_seed=utils.jax_randint(next(local_rng)), data_dir=data_dir)
 		ds = ds.shuffle(
 				self._shuffle_buffer_size(split),
 				seed=utils.jax_randint(next(local_rng)))
@@ -150,7 +152,7 @@ class CIFAR10(Dataset):
 	def info(self):
 		return self._info
 
-	def _load_tfds(self, *, split, shuffle_seed):
+	def _load_tfds(self, *, split, shuffle_seed, data_dir=None):
 		return tfds.load(
 				'cifar10',
 				split={'train': 'train', 'eval': 'test'}[split],
@@ -221,7 +223,7 @@ class ImageNet(Dataset):
 	def info(self):
 		return self._info
 
-	def _load_tfds(self, *, split, shuffle_seed):
+	def _load_tfds(self, *, split, shuffle_seed, data_dir=None):
 		return tfds.load(
 				'imagenet2012',
 				split={'train': 'train', 'eval': 'validation'}[split],
@@ -261,65 +263,60 @@ class ImageNet(Dataset):
 		return out
 
 
-class LSUN(Dataset):
-	"""LSUN dataset."""
+class LatentImageNetEncodings(Dataset):
+	"""Latent ImageNet dataset."""
 
-	def __init__(self, *, subset, image_size, randflip,
-							 extra_image_sizes=()):
-		"""LSUN datasets.
+	def __init__(self,
+					*,
+					class_conditional,
+					image_size,
+					randflip,
+					extra_image_sizes=()):
+		"""ImageNet dataset.
 
 		Args:
-			subset: str: 'church' or 'bedroom'
-			image_size: int: size of image to model, 64 or 128
+			class_conditional: bool: class conditional generation problem; if True,
+				generated examples will contain a label.
+			image_size: int: size of image to model
 			randflip: bool: random flip augmentation
-			extra_image_sizes: optional extra image sizes
+			extra_image_sizes: Tuple[int]: also provide image at these resolutions
 		"""
-		self._subset = subset
+		self._class_conditional = class_conditional
 		self._image_size = image_size
 		self._randflip = randflip
 		self._extra_image_sizes = extra_image_sizes
-
 		self._info = {
-				'data_shape': (self._image_size, self._image_size, 3),
-				'num_train': {'bedroom': 3033042, 'church': 126227}[self._subset],
-				'num_eval': 300,
-				'num_classes': 1,
+				'data_shape': (self._image_size, self._image_size, 4),
+				'num_classes': 1000 if self._class_conditional else 1
 		}
 
 	@property
 	def info(self):
 		return self._info
 
-	def _load_tfds(self, *, split, shuffle_seed):
-		tfds_name = {'church': 'lsun/church_outdoor',
-								 'bedroom': 'lsun/bedroom'}[self._subset]
-		return tfds.load(
-				tfds_name,
-				split={'train': 'train', 'eval': 'validation'}[split],
-				shuffle_files=shuffle_seed is not None,
-				read_config=None if shuffle_seed is None else tfds.ReadConfig(
-						shuffle_seed=shuffle_seed),
-				decoders={'image': tfds.decode.SkipDecoding()})
+	def _load_tfds(self, *, split, shuffle_seed, data_dir=None):
+		tfrecord_filenames = [os.path.join(data_dir, fname) for fname in tf.io.gfile.listdir(data_dir)]
+		python_random.shuffle(tfrecord_filenames) #mixes up tfrecord file orders so the first files dont get seen more frequently than others when using preemptible instances.
+
+		raw_dataset = tf.data.TFRecordDataset(tfrecord_filenames, num_parallel_reads=tf.data.AUTOTUNE)
+		return raw_dataset
 
 	def _preprocess(self, x, *, split, augment):
-		del split  # unused
+		features = {
+			"x": tf.io.FixedLenFeature([], tf.string)
+		}
+		if self._info["num_classes"] > 0:
+			features["y"] =  tf.io.FixedLenFeature([], tf.string)
+		example = tf.io.parse_single_example(x, features)
 
-		# Decode the image and resize
-		img = tf.cast(decode_and_central_square_crop(x['image']), tf.float32)
-		if augment:  # NOTE: nondeterministic
-			if self._randflip:
-				aug_img = tf.image.flip_left_right(img)
-				aug = tf.random.uniform(shape=[]) > 0.5
-				img = tf.where(aug, aug_img, img)
+		image = tf.io.parse_tensor(example["x"], tf.float16)
+		image = tf.cast(image, tf.float32) * 0.18215
+		image = tf.reshape(image, self._info["data_shape"])
 
-		out = {}
-		out['image'] = tf.clip_by_value(tf.image.resize(
-				img, [self._image_size, self._image_size], antialias=True), 0, 255)
+		data_entries = {"image": image}
+		
+		if self._info["num_classes"] > 1:
+			label = tf.io.parse_tensor(example["y"], tf.int64)
+			data_entries["label"] = tf.cast(label, tf.int32)
 
-		# Optionally provide the image at other resolutions too
-		for s in self._extra_image_sizes:
-			assert isinstance(s, int)
-			out[f'extra_image_{s}'] = tf.clip_by_value(
-					tf.image.resize(img, [s, s], antialias=True), 0, 255)
-
-		return out
+		return data_entries

@@ -166,7 +166,10 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
             uncond_embeddings = self.text_encoder(uncond_input.input_ids, params=params["text_encoder"])[0]
             context = jnp.concatenate([uncond_embeddings, text_embeddings])
         else:
-            context = None
+            context = prompt_ids #prompt_ids in this case is class label, not text label.
+            if isinstance(context, jnp.array):
+                uncond_context = jnp.full_like(context, self.unet.num_classes, dtype=jnp.int32)
+                context = jnp.cocnatenate([uncond_context, context], axis=0)
 
         if latents is None:
             latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
@@ -175,7 +178,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
                 raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}")
 
         model_fn = lambda x, logsnr: self.unet.apply(
-			{'params': params["unet"]}, x=x, logsnr=logsnr, y=None, train=False) #TODO: allow for label and text input.
+			{'params': params["unet"]}, x=x, logsnr=logsnr, y=context, train=False) #TODO: allow for label and text input.
         
         margs = self.model_config
         model_wrap = DiffusionWrapper(
@@ -193,10 +196,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            if guidance_scale > 1.0:
-                latents_input = jnp.concatenate([latents] * 2)
-            else:
-                latents_input = latents 
+            latents_input = jnp.concatenate([latents] * 2)
 
             t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
             timestep = jnp.broadcast_to(t, latents_input.shape[0]).astype(latents_input.dtype)
@@ -209,6 +209,9 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
                 model_fn=model_fn,
                 clip_x=True
             )["model_eps"]
+
+            noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
 
             latents, scheduler_state = self.scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
             return latents, scheduler_state #DO jnp.where(i == 0, x_pred_t, z_s_pred), this fixes adding noise of beta_1 at the end.

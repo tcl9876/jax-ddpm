@@ -25,10 +25,18 @@ def _logsnr_schedule_cosine(t, *, logsnr_min, logsnr_max):
     a = onp.arctan(onp.exp(-0.5 * logsnr_min)) - b
     return -2. * jnp.log(jnp.tan(a * t + b))
 
+#in its current implementation, forces discrete time. can maybe use  alpha = exp(1 - int(0, t)[-b(t)*1000]dt)
+def _logsnr_schedule_linear(t, *, beta_start, beta_end, num_timesteps):
+    beta_set = onp.linspace(beta_start, beta_end, num_timesteps)
+    alpha_set = jnp.cumprod(1 - beta_set)
+    nearest_t = jnp.abs((t[:, None] - jnp.arange(1000))).argmin(axis=-1)
+    return jnp.log(alpha_set[nearest_t]) - jnp.log(1 - alpha_set[nearest_t]) #log(snr) = log(a/(1-a)) = log(a) - log(1-a)
 
 def get_logsnr_schedule(name, **kwargs):
     """Get log SNR schedule (t==0 => logsnr_max, t==1 => logsnr_min)."""
     schedules = {
         'cosine': _logsnr_schedule_cosine,
+        'linear': _logsnr_schedule_linear
     }
     return functools.partial(schedules[name], **kwargs)
+
