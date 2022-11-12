@@ -62,7 +62,7 @@ def get_config():
                                   logsnr_min=-20., logsnr_max=20.),
           eval_logsnr_schedule=D(name='cosine',
                                  logsnr_min=-20., logsnr_max=20.),
-          eval_clip_denoised=True,
+          eval_clip_denoised=False,
       ),
       train=D(
           # optimizer
