@@ -175,7 +175,7 @@ class DiffusionWrapper:
 			assert logsnr.shape == eps_mse.shape
 			reweighting_factor = 1 / (1 + jnp.exp(logsnr))
 			loss = eps_mse * reweighting_factor
-		elif reweighting_factor == 'p2_half':
+		elif mean_loss_weight_type == 'p2_half':
 			#p2 with gamma = 0.5. This might be better as its in the latent space where imperceptible information has been removed already.
 			reweighting_factor = 1 / jnp.sqrt(1 + jnp.exp(logsnr))
 			loss = eps_mse * reweighting_factor

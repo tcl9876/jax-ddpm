@@ -168,6 +168,8 @@ class CIFAR10(Dataset):
 				aug_img = tf.image.flip_left_right(img)
 				aug = tf.random.uniform(shape=[]) > 0.5
 				img = tf.where(aug, aug_img, img)
+		
+		img = img / 127.5 - 1. 
 		out = {'image': img}
 		if self._class_conditional:
 			out['label'] = tf.cast(x['label'], tf.int32)
@@ -246,15 +248,18 @@ class ImageNet(Dataset):
 				img = tf.image.random_flip_left_right(img)
 
 		# Standard area resizing
-		out['image'] = tf.clip_by_value(
+		image = tf.clip_by_value(
 				tf.image.resize(img, [self._image_size, self._image_size], 'area'),
 				0, 255)
+		out['image'] = image / 127.5 - 1. 
 
 		# Optionally provide the image at other resolutions too
 		for s in self._extra_image_sizes:
 			assert isinstance(s, int)
-			out[f'extra_image_{s}'] = tf.clip_by_value(
+			sr_image = tf.clip_by_value(
 					tf.image.resize(img, [s, s], 'area'), 0, 255)
+			out[f'extra_image_{s}'] = sr_image / 127.5 - 1.
+			
 
 		# Class label
 		if self._class_conditional:

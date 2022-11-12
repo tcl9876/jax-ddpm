@@ -12,11 +12,11 @@ from flax.training.common_utils import shard
 from PIL import Image
 from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
 
-from dpm import Model as DiffusionWrapper
+from diffusion.dpm import DiffusionWrapper
+from diffusion.schedules import get_logsnr_schedule
 from diffusers.models.vae_flax import FlaxAutoencoderKL
 from diffusers.schedulers import FlaxDDIMScheduler, FlaxLMSDiscreteScheduler, FlaxPNDMScheduler
 from diffusers.utils import logging
-from schedules import get_logsnr_schedule
 #from . import FlaxStableDiffusionPipelineOutput
 #from .safety_checker_flax import FlaxStableDiffusionSafetyChecker
 
@@ -167,9 +167,9 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
             context = jnp.concatenate([uncond_embeddings, text_embeddings])
         else:
             context = prompt_ids #prompt_ids in this case is class label, not text label.
-            if isinstance(context, jnp.array):
+            if isinstance(context, jnp.ndarray):
                 uncond_context = jnp.full_like(context, self.unet.num_classes, dtype=jnp.int32)
-                context = jnp.cocnatenate([uncond_context, context], axis=0)
+                context = jnp.concatenate([uncond_context, context], axis=0)
 
         if latents is None:
             latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
@@ -189,6 +189,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
         )
         logsnr_schedule_fn=get_logsnr_schedule(
 				**margs.eval_logsnr_schedule)
+        print(margs.eval_logsnr_schedule)
         
         latents = jnp.transpose(latents, [0, 2, 3, 1]) #prog-dist unet takes in NHWC, may change if we switch to diffusers Unet
         def loop_body(step, args):
@@ -207,7 +208,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
                 z=jnp.array(latents_input),
                 logsnr=logsnr_t, #jnp.full((latents.shape[0],), logsnr_t),
                 model_fn=model_fn,
-                clip_x=True
+                clip_x=margs.eval_clip_denoised
             )["model_eps"]
 
             noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
@@ -228,17 +229,20 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
             for i in range(num_inference_steps):
                 latents, scheduler_state = loop_body(i, (latents, scheduler_state))
         else:
+            #latents = loop_body(0, (latents, scheduler_state))
             latents, _ = jax.lax.fori_loop(0, num_inference_steps, loop_body, (latents, scheduler_state))
+
 
         if self.vae is not None: #allow VAE to be None for pixel space ddpm
             # scale and decode the image latents with vae
-            latents = 1 / 0.18215 * latents
+            latents = latents / 0.18215
+            latents = latents.transpose(0, 3, 1, 2)
             image = self.vae.apply({"params": params["vae"]}, latents, method=self.vae.decode).sample
         else:
-            image = latents
+            image = latents.transpose(0, 3, 1, 2)
             
-        image = (image / 2 + 0.5).clip(0, 1)#.transpose(0, 2, 3, 1) #prog-dist unet takes in NHWC, may add back if we switch to diffusers Unet
-        return image
+        image = (image / 2 + 0.5).clip(0, 1).transpose(0, 2, 3, 1)
+        return image, latents
 
     def __call__(
         self,

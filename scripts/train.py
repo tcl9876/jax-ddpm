@@ -71,6 +71,8 @@ def main(_):
     train_step = functools.partial(jax.lax.scan, train_step)  # for substeps
     train_step = jax.pmap(train_step, axis_name='batch', donate_argnums=(0,))
 
+    print("TRAINING CONFIG:")
+    print(config)
     total_bs = config.train.batch_size
     device_bs = total_bs // jax.device_count()
     train_ds = trainer.dataset.get_shuffled_repeated_dataset(

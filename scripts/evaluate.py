@@ -13,9 +13,10 @@ from jax_modules.unet import UNet
 from jax_modules.utils import save_tiled_imgs
 from tqdm.auto import tqdm
 import diffusers
-from flax_pipeline import FlaxGeneralDiffusionPipeline
-from diffusers import FlaxAutoencoderKL
+from diffusion.flax_pipeline import FlaxGeneralDiffusionPipeline 
+from diffusers import FlaxStableDiffusionPipeline as OriginalStablePipeline
 import wandb
+from datasets import datasets
 
 tf_set_visible_devices([], device_type="GPU")
 np.set_printoptions(precision=4)
@@ -30,7 +31,7 @@ flags.DEFINE_string("save_dir", None, "the directory to save your results to.")
 flags.DEFINE_string("n_samples", "36", "the number of samples you want to create. can be comma-separated list.")
 flags.DEFINE_integer("n_steps", 1000, "how many evaluation steps you want to use")
 flags.DEFINE_integer("max_batch_size", 64, "the maximum allowable batch size for sampling.")
-flags.DEFINE_string("auth token", None, "hugging face authentication token for Stable Diffusion.")
+flags.DEFINE_string("auth_token", None, "hugging face authentication token for Stable Diffusion.")
 flags.DEFINE_integer("height", 256, "image height.")
 flags.DEFINE_integer("width", 256, "image width.")
 flags.DEFINE_integer("ncol", 6, "if you are making a grid, the number of columns in the grid. By default, we use 6 columns.")
@@ -43,10 +44,11 @@ def main(_):
     config = args.config
     config.unlock()
 
-    if config.eval_snr_schedule.name == "cosine":
+    eval_schedule = config.model.eval_logsnr_schedule
+    if eval_schedule.name == "cosine":
         scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="squaredcos_cap_v2")
-    elif config.eval_snr_schedule.name == "linear":
-        scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="linear", beta_start=config.eval_snr_schedule.beta_start, beta_end=config.eval_snr_schedule.beta_end)
+    elif eval_schedule.name == "linear":
+        scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="linear", beta_start=eval_schedule.beta_start, beta_end=eval_schedule.beta_end)
     else:
         raise NotImplementedError
 
@@ -55,18 +57,34 @@ def main(_):
     
     restored_sd = restore_checkpoint(args.checkpoint_dir, None) #restore the checkpoint as a dict.
     del restored_sd["optimizer_state"]
-    print(f"Restored Checkpoint from {restored_sd.step} steps")
+    step = restored_sd["step"]
+    print(f"Restored Checkpoint from {step} steps")
+
     params = {
         "unet": restored_sd["ema_params"],
         "scheduler": scheduler_state
     }
-    unet = UNet(**config.model.args)
 
+    num_classes = getattr(datasets, config.dataset.name)(
+				**config.dataset.args).num_classes
+
+    unet = UNet(**config.model.args, num_classes=num_classes)
+    setattr(unet, 'in_channels', unet.out_ch) #force overwrite for now, will be unneeded when using diffusers unet
+
+    if args.height == 256:
+        stable_pipe, stable_params = OriginalStablePipeline.from_pretrained("CompVis/stable-diffusion-v1-4", revision="bf16", use_auth_token=args.auth_token)
+        vae, vae_params = stable_pipe.vae, stable_params["vae"]
+        vae_params = jax.tree_util.tree_map(lambda x: x.astype('float32'), vae_params) #diffusers doesn't like loading w/o bf16
+        params["vae"] = vae_params
+        del stable_params["unet"]
+    else:
+        vae = None
+    
     devices = jax.devices()
     print("DEVICES:", devices)
     params = flax.jax_utils.replicate(params, devices=devices)
 
-    vae = FlaxAutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", use_auth_token=args.auth_token)
+
     pipe = FlaxGeneralDiffusionPipeline(
         vae=vae, 
         text_encoder=None, 
@@ -75,13 +93,13 @@ def main(_):
         scheduler=scheduler,
         safety_checker=None,
         feature_extractor=None,
-        dtype=jnp.bfloat16,
+        dtype=jnp.float32,
         model_config=config.model
     )
 
-    h, w, c = args.height, args.width, unet.out_ch
+    h, w = args.height, args.width
     n_samples_list = [int(n) for n in args.n_samples.split(",")]
-    samples = np.zeros(shape=(0, h, w, c)).astype('uint8')
+    samples = np.zeros(shape=(0, h, w, 3)).astype('uint8')
     global_rng = jax.random.PRNGKey(0)
 
     for n_samples in n_samples_list:
@@ -99,18 +117,19 @@ def main(_):
                 global_rng, class_key = jax.random.split(global_rng)
                 prompt_ids = jax.random.randint(class_key, shape=(jax.device_count(), per_replica_bs), minval=0, maxval=unet.num_classes)
 
-            current_images = pipe(
+            current_images, latents = pipe(
                 prompt_ids=prompt_ids,
                 params=params,
                 prng_seed=rng,
                 num_inference_steps=args.n_steps,
                 height=h,
                 width=w,
-                guidance_scale=1.0,
+                guidance_scale=float(args.guidance_scale),
                 jit=True
-            ).block_until_ready()
+            )
+            print(f"Mean {latents.mean()} , Std {latents.std()} , Min {latents.min()} , Max {latents.max()}")
 
-            current_images = np.array(current_images.reshape(-1, 32, 32, 3))[:batch_size]
+            current_images = np.array(current_images.reshape(-1, h, w, 3))[:batch_size]
             current_images = np.clip(current_images * 255, 0, 255).astype('uint8')
             samples = np.concatenate((samples, current_images), axis=0)
         

@@ -112,13 +112,11 @@ class Trainer:
 
 	def loss_fn(self, rng, train, batch, params):
 		"""Training loss for diffusion model."""
-		#TODO: remove dataset normalization/preprocessing here?
 		rng = utils.RngGen(rng)
 
 		# Input: image
 		img = batch['image']
 		assert img.dtype == jnp.float32
-		img = utils.normalize_data(img)  # scale image to [-1, 1]
 
 		# Input: label
 		label = batch.get('label', None)
@@ -126,10 +124,10 @@ class Trainer:
 			assert label.shape == (img.shape[0],)
 			assert label.dtype == jnp.int32
 		
-		#drop randomly for CFG
-		uncond_label = jnp.full_like(label, self.model.num_classes)
-		mask = jnp.greater(jax.random.uniform(next(rng), label.shape), 0.9).astype(jnp.int32)
-		label = label*(1-mask) + mask*uncond_label
+			#drop randomly for CFG
+			uncond_label = jnp.full_like(label, self.model.num_classes)
+			mask = jnp.greater(jax.random.uniform(next(rng), label.shape), 0.9).astype(jnp.int32)
+			label = label*(1-mask) + mask*uncond_label
 
 		def model_fn(x, logsnr):
 			return self.model.apply(

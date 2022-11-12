@@ -48,6 +48,7 @@ def get_config():
               dropout=0.2,
               logsnr_input_type='inv_cos',
               resblock_resample=True,
+              out_ch=3
           ),
           mean_type='eps', # eps, x, both, v
           logvar_type='fixed_large',
