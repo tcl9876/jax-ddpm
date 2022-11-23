@@ -39,6 +39,15 @@ def normalize_data(x):
 def unnormalize_data(x):
 	return (x + 1.) * 127.5
 
+def to_bf16(params):
+	def bf16(x):
+		return x.astype(jnp.bfloat16)
+	return jax.tree_util.tree_map(bf16, params)
+
+def to_fp32(params):
+	def fp32(x):
+		return x.astype(jnp.float32)
+	return jax.tree_util.tree_map(fp32, params)
 
 def nearest_neighbor_upsample(x, k=2):
 	B, H, W, C = x.shape
@@ -165,9 +174,9 @@ def assert_synced(pytree):
 		raise RuntimeError('Sync check failed!')
 
 
-@functools.partial(jax.pmap, axis_name='i')
+@functools.partial(jax.pmap, axis_name='batch')
 def _barrier(x):
-	return jax.lax.psum(x, axis_name='i')
+	return jax.lax.psum(x, axis_name='batch')
 
 
 def barrier():

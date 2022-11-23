@@ -5,9 +5,9 @@ import jax
 import flax
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-from jax_modules.train_util import Trainer, Metrics
+from jax_modules.train_util import Trainer, Metrics, local_shard_pytree
 from jax_modules.checkpoints import save_checkpoint, restore_checkpoint
-from jax_modules.utils import numpy_iter, unreplicate
+from jax_modules.utils import numpy_iter, unreplicate, barrier
 from tensorflow.io import gfile, write_file
 import wandb
 
@@ -44,9 +44,10 @@ def main(_):
     #dargs.batch_size = targs.batch_size #set tfds dataloader batch size based on specified batch size in training args.
     targs.checkpoint_dirs = [subdir.format(global_dir) for subdir in targs.checkpoint_dirs]
     targs.log_dir = targs.log_dir.format(global_dir)
+    ismain = (jax.process_index() == 0)
     
-    use_wandb = args.wandb_project is not None
-    if use_wandb:
+    use_wandb = (args.wandb_project is not None and args.wandb_run is not None)
+    if use_wandb and ismain:
         wandb.login()
         wandb.init(
             project=args.wandb_project,
@@ -56,30 +57,34 @@ def main(_):
         )
 
     logfile_path = os.path.join(targs.log_dir, 'logfile.txt')
-    if not gfile.exists(logfile_path):
+    if not gfile.exists(logfile_path) and ismain:
         write_file(logfile_path, "")
-    #print_and_log = functools.partial(print_and_log_dict, logfile_path=logfile_path)
 
-    #TODO: add checkpoint restoration.
+    if ismain:
+        print("MODEL CONFIG:", config.model)
+        print("TRAINING CONFIG:", targs)
+
     trainer = Trainer(config)
-    state = jax.device_get(trainer.make_init_state())
+    state = trainer.make_init_state()
     state = restore_checkpoint(targs.checkpoint_dirs[0], state)
-    print(f"Current iteration after restore: {state.step}")
-    state = flax.jax_utils.replicate(state)
+    
+    devices = jax.devices()
+    start_step = int(unreplicate(state.step))
+    barrier()
+    if ismain:
+        print(f"Current iteration after restore: {start_step}")
+        print("training devices:", devices)
+        print("device count:", len(devices))
 
-    train_step = functools.partial(trainer.step_fn, jax.random.PRNGKey(0), True)
-    train_step = functools.partial(jax.lax.scan, train_step)  # for substeps
-    train_step = jax.pmap(train_step, axis_name='batch', donate_argnums=(0,))
+    fb_step = jax.pmap(trainer.forward_backward, axis_name='batch')
+    update_func = jax.pmap(trainer.update, axis_name='i')
 
-    print("TRAINING CONFIG:")
-    print(config)
     total_bs = config.train.batch_size
-    device_bs = total_bs // jax.device_count()
+    device_bs = total_bs // len(devices)
     train_ds = trainer.dataset.get_shuffled_repeated_dataset(
         split='train',
         batch_shape=(
-            jax.local_device_count(),  # for pmap
-            config.train.substeps,  # for lax.scan over multiple substeps
+            len(devices),  # should it be device_count or local_device_count for multinode?
             device_bs,  # batch size per device
         ),
         local_rng=jax.random.PRNGKey(0),
@@ -90,15 +95,36 @@ def main(_):
     s = time.time()
     metrics = Metrics(["train/gnorm", "train/loss"])
 
-    for global_step in range(unreplicate(state.step), targs.iterations + targs.substeps, targs.substeps):
+    global_rng = jax.random.PRNGKey(0)
+    for global_step in range(start_step, targs.iterations + 1):
         batch = next(train_iter)
-        state, new_metrics = train_step(state, batch)
-        if global_step%2==0:
+        global_rng, *train_step_rng = jax.random.split(global_rng, num=jax.device_count() + 1)
+        train_step_rng = jax.device_put_sharded(train_step_rng, devices)
+
+		#first run forward and backwards pass, and all-reduce the grads across ALL nodes. 
+		#then self.optimizer.update takes the grads and applies them seperately per node. then we wait for all nodes to finish via a barrier.
+        grad, new_metrics = fb_step(train_step_rng, batch, state.params)
+
+        """
+        sg = jax.tree_util.tree_flatten(grad)[0]
+        sp = jax.tree_util.tree_flatten(state.sharded_params)[0]
+        for a, b in zip(sg, sp):
+            print(a.shape, b.shape)
+        
+        for i in jax.tree_util.tree_flatten(state.optimizer_state[0])[0]:
+            if len(i.shape) == 0:
+                print(i)
+        """
+
+        state = update_func(state, grad)
+        barrier() #benchmark speed w/o barrier, in case jax.device_get is slow
+
+        if global_step%20==0:
             new_metrics = unreplicate(new_metrics)
             new_metrics = jax.tree_map(lambda x: float(x.mean()), new_metrics)
             metrics.update(new_metrics)
 
-        if global_step % targs.log_loss_every_steps==0 and global_step > targs.substeps: 
+        if global_step % targs.log_loss_every_steps==0: 
             real_step = unreplicate(state.step)
             kwargs = {
                 "real step": real_step,
@@ -106,13 +132,13 @@ def main(_):
                 "metrics": metrics,
                 "seconds elapsed": round(time.time()-s)
             }
-            print_and_log_dict(logfile_path, kwargs)
+            if ismain:
+                print_and_log_dict(logfile_path, kwargs)
             metrics.reset_states()
         
         for checkpoint_dir, num_checkpoints, save_freq in zip(targs.checkpoint_dirs, targs.num_checkpoints, targs.save_freq):
-            if global_step%save_freq==0:
-                unreplicated_state = unreplicate(state)
-                save_checkpoint(checkpoint_dir, unreplicated_state, keep=num_checkpoints, step=unreplicated_state.step)
+            if global_step%save_freq==0 and ismain:
+                save_checkpoint(checkpoint_dir, state, keep=num_checkpoints, step=unreplicate(state.step))
         
 
 if __name__ == '__main__':

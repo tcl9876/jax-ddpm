@@ -22,28 +22,32 @@
 
 
 import functools
-from typing import Any
+from typing import Any, Union
 
 from datasets import datasets
 from diffusion.dpm import DiffusionWrapper
 from diffusion.schedules import get_logsnr_schedule
 from .unet import UNet
 from . import utils
-from .optimizer import make_optimizer
+from .optimizer import make_adam, shard_pytree, unshard_pytree
 from absl import logging
 import flax
 import jax
 import jax.numpy as jnp
 import optax
+from flax.jax_utils import replicate, unreplicate
 
+
+local_shard_pytree = jax.pmap(shard_pytree, axis_name='i', devices=jax.local_devices())
+#local_unshard_pytree = jax.pmap(unshard_pytree, axis_name='i', devices=jax.local_devices())
 
 @flax.struct.dataclass
 class TrainState:
 	step: int
 	params: Any
+	sharded_params: Any #possible sharded FP32 copy of model parameters
 	optimizer_state: Any
 	ema_params: Any
-	num_sample_steps: int
 
 
 class Trainer:
@@ -61,18 +65,14 @@ class Trainer:
 		self._eval_step = None
 
 		# infer number of output channels for UNet
-		"""
 		x_ch = self.dataset.data_shape[-1]
-		out_ch = config.model.out_ch
+		out_ch = x_ch
 		if config.model.mean_type == 'both':
 			out_ch += x_ch
 		if 'learned' in config.model.logvar_type:
 			out_ch += x_ch
-		"""
 
-		self.model = UNet(
-			num_classes=self.dataset.num_classes,
-			**config.model.args)
+		self.model = UNet(**config.model.args)
 
 	@property
 	def current_num_steps(self):
@@ -97,33 +97,36 @@ class Trainer:
 		logging.info('Number of trainable parameters: {:,}'.format(
 			utils.count_params(init_params)))
 
-		# Make the optimizer
-		self.tx = make_optimizer(self.config)
-		optimizer_state = self.tx.init(init_params)
+		init_params = replicate(init_params)
+		sharded_params = local_shard_pytree(utils.to_fp32(init_params))
+		ema_params = utils.copy_pytree(sharded_params)
+		self.tx = make_adam(self.config)
+		optimizer_state = replicate(self.tx.init(unreplicate(ema_params)))
+		self.update = self.make_update_fn()
 
-		# For ema_params below, copy so that pmap buffer donation doesn't donate the
-		# same buffer twice
 		return TrainState(
-			step=0,
+			step=replicate(0),
 			params=init_params,
+			sharded_params=sharded_params,
 			optimizer_state=optimizer_state,
-			ema_params=utils.copy_pytree(init_params),
-			num_sample_steps=self.config.model.train_num_steps)
+			ema_params=ema_params
+		)
 
 	def loss_fn(self, rng, train, batch, params):
 		"""Training loss for diffusion model."""
+		#NOTE: 'label' can mean conditioning sequence. in future maybe split into T5 and clip.
 		rng = utils.RngGen(rng)
 
 		# Input: image
 		img = batch['image']
 		assert img.dtype == jnp.float32
-
+		
 		# Input: label
 		label = batch.get('label', None)
 		if label is not None:
-			assert label.shape == (img.shape[0],)
+			assert label.shape == (img.shape[0],), (label.shape, (img.shape[0],))
 			assert label.dtype == jnp.int32
-		
+
 			#drop randomly for CFG
 			uncond_label = jnp.full_like(label, self.model.num_classes)
 			mask = jnp.greater(jax.random.uniform(next(rng), label.shape), 0.9).astype(jnp.int32)
@@ -143,8 +146,7 @@ class Trainer:
 			target_model_fn=target_model_fn,
 			mean_type=self.config.model.mean_type,
 			logvar_type=self.config.model.logvar_type,
-			logvar_coeff=self.config.model.get('logvar_coeff', 0.),
-			loss_scale=self.config.model.get('loss_scale', 1.))
+			logvar_coeff=self.config.model.get('logvar_coeff', 0.))
 		loss_dict = model.training_losses(
 			x=img,
 			rng=next(rng),
@@ -157,69 +159,84 @@ class Trainer:
 		loss_dict = {k: v.mean() for (k, v) in loss_dict.items()}
 		return loss_dict['loss'], loss_dict
 
-	def step_fn(self, base_rng, train, state, batch):
-		"""One training/eval step."""
-		config = self.config
-
-		# RNG for this step on this host
-		step = state.step
-		rng = jax.random.fold_in(base_rng, jax.lax.axis_index('batch'))
-		rng = jax.random.fold_in(rng, step)
+	def forward_backward(self, rng, batch, params):
 		rng = utils.RngGen(rng)
 
 		# Loss and gradient
-		loss_fn = functools.partial(self.loss_fn, next(rng), train, batch)
+		loss_fn = functools.partial(self.loss_fn, next(rng), True, batch)
 
-		if train:
-			# Training mode
-			(_, metrics), grad = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+		# Training mode
+		(_, metrics), grad = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-			# Average grad across shards
-			grad, metrics['gnorm'] = utils.clip_by_global_norm(
-				grad, clip_norm=config.train.grad_clip)
-			grad = jax.lax.pmean(grad, axis_name='batch')
-
-			# Update optimizer and EMA params
-			updates, new_opt_state = self.tx.update(
-				grad, state.optimizer_state, state.params)
-			new_params = optax.apply_updates(state.params, updates)
-
-			if hasattr(config.train, 'ema_decay'):
-				ema_decay = config.train.ema_decay
-			elif config.train.avg_type == 'ema':
-				ema_decay = 1. - (1. / config.train.avg_steps)
-			elif config.train.avg_type == 'aa':
-				t = step % config.train.avg_steps
-				ema_decay = t / (t + 1.)
-			elif config.train.avg_type is None:
-				ema_decay = 0.
-			else:
-				raise NotImplementedError(config.train.avg_type)
-			if ema_decay == 0:
-				new_ema_params = new_params
-			else:
-				new_ema_params = utils.apply_ema(
-					decay=jnp.where(step == 0, 0.0, ema_decay),
-					avg=state.ema_params,
-					new=new_params)
-
-			state = state.replace(
-				step=step + 1,
-				params=new_params,
-				optimizer_state=new_opt_state,
-				ema_params=new_ema_params)
-			
-		else:
-		# Eval mode with EMA params
-			_, metrics = loss_fn(state.ema_params)
+		# Average grad across shards
+		grad, metrics['gnorm'] = utils.clip_by_global_norm(
+			grad, clip_norm=self.config.train.grad_clip)
+		grad = jax.lax.pmean(grad, axis_name='batch')
 
 		# Average metrics across shards
 		metrics = jax.lax.pmean(metrics, axis_name='batch')
 		assert all(v.shape == () for v in metrics.values())
 		metrics = {  # prepend prefix to names of metrics
-			f"{'train' if train else 'eval'}/{k}": v for k, v in metrics.items()
+			f"train/{k}": v for k, v in metrics.items()
 		}
-		return (state, metrics) if train else metrics
+
+		return grad, metrics
+	
+	def make_update_fn(self):
+		def update_fn(state, grad):
+			#first convert grad to fp32, then apply adam update on sharded FP32 state, then unshard and downcast the fp32 model params.
+			
+			sharded_grad = utils.to_fp32(shard_pytree(grad))
+
+			updates, new_opt_state = self.tx.update(
+				sharded_grad, state.optimizer_state, state.sharded_params
+			)
+			new_sharded_params = optax.apply_updates(state.sharded_params, updates)
+
+			new_ema_params = utils.apply_ema(self.config.train.ema_decay, 
+				avg=state.ema_params, new=new_sharded_params)
+
+			new_params = unshard_pytree(utils.to_bf16(new_sharded_params))
+			return state.replace(
+				step=state.step + 1,
+				params=new_params,
+				sharded_params=new_sharded_params,
+				optimizer_state=new_opt_state,
+				ema_params=new_ema_params
+			)
+		
+		return update_fn
+	
+	"""
+	def state_dict(self, state):
+		#returns a saveable dict of params, ema_params and optimizer_state that's stored on the CPU and is fully unsharded.
+		cpu = lambda x: utils.unreplicate(x)
+		return {
+			"step": state.step,
+			"params": cpu(unshard_pytree(state.sharded_params)),
+			"ema_params": cpu(unshard_pytree(state.ema_params)),
+			"optimizer_state": cpu(unshard_pytree(state.optimizer_state))
+		}
+
+	def load_state_dict(self, state_dict):
+		if state_dict is None:
+			print("No restored state dict.")
+			return None
+
+		self.step = replicate(jnp.int32(state_dict["step"]))
+		self.params = replicate(state_dict["params"])
+		self.optimizer.ema_params = local_shard_pytree(replicate(state_dict["ema_params"]))
+		self.optimizer.optimizer_state = local_shard_pytree(replicate(state_dict["optimizer_state"]))
+
+		return TrainState(
+			step=replicate(jnp.int32(state_dict["step"])),
+			params=replicate(utils.to_bf16(state_dict["params"])),
+			sharded_params=local_shard_pytree(replicate(state_dict["params"])),
+			optimizer_state=local_shard_pytree(replicate(state_dict["optimizer_state"])),
+			ema_params=local_shard_pytree(replicate(state_dict["ema_params"]))
+		)
+	"""
+		
 
 class MeanObject(object):
     def __init__(self):

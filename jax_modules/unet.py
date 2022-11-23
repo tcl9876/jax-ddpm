@@ -18,7 +18,7 @@
 # pytype: disable=wrong-keyword-args,wrong-arg-count
 # pylint: disable=logging-format-interpolation,g-long-lambda
 
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any
 
 from absl import logging
 from flax import linen as nn
@@ -27,7 +27,15 @@ import jax.numpy as jnp
 import numpy as onp
 
 nonlinearity = nn.swish
-Normalize = nn.normalization.GroupNorm
+
+class Normalize(nn.Module):
+	name: str
+
+	@nn.compact
+	def __call__(self, x):
+		x_dtype = x.dtype
+		normx_32 = nn.normalization.GroupNorm()(x.astype('float32'))
+		return normx_32.astype(x_dtype)
 
 
 def get_timestep_embedding(timesteps, embedding_dim,
@@ -73,6 +81,7 @@ class ResnetBlock(nn.Module):
 	dropout: float
 	out_ch: Optional[int] = None
 	resample: Optional[str] = None
+	param_dtype: Optional[Any] = jnp.float32
 
 	@nn.compact
 	def __call__(self, x, *, emb, deterministic):
@@ -89,10 +98,10 @@ class ResnetBlock(nn.Module):
 			h = updown(h)
 			x = updown(x)
 		h = nn.Conv(
-				features=out_ch, kernel_size=(3, 3), strides=(1, 1), name='conv1')(h)
+				features=out_ch, kernel_size=(3, 3), strides=(1, 1), name='conv1', param_dtype=self.param_dtype)(h)
 
 		# add in timestep/class embedding
-		emb_out = nn.Dense(features=2 * out_ch, name='temb_proj')(
+		emb_out = nn.Dense(features=2 * out_ch, name='temb_proj', param_dtype=self.param_dtype)(
 				nonlinearity(emb))[:, None, None, :]
 		scale, shift = jnp.split(emb_out, 2, axis=-1)
 		h = Normalize(name='norm2')(h) * (1 + scale) + shift
@@ -104,10 +113,11 @@ class ResnetBlock(nn.Module):
 				kernel_size=(3, 3),
 				strides=(1, 1),
 				kernel_init=nn.initializers.zeros,
-				name='conv2')(h)
+				name='conv2', 
+				param_dtype=self.param_dtype)(h)
 
 		if C != out_ch:
-			x = nn.Dense(features=out_ch, name='nin_shortcut')(x)
+			x = nn.Dense(features=out_ch, name='nin_shortcut', param_dtype=self.param_dtype)(x)
 
 		assert x.shape == h.shape
 		logging.info(
@@ -115,11 +125,9 @@ class ResnetBlock(nn.Module):
 				self.name, x.shape, emb.shape, self.resample)
 		return x + h
 
-#the astype's is a workaround for now, when switching to HF Unet, will use full mixed-precision training.
 @jax.checkpoint
 def lowmem_dot_product_attention(q, k, v):
-	#TODO: convert to a jax.lax.fori_loop over the heads, possibly over the batch axis instead/as well for 64^2
-	q, k, v = q.astype(jnp.bfloat16), k.astype(jnp.bfloat16), v.astype(jnp.bfloat16)
+	#TODO: maybe convert to a jax.lax.fori_loop over the heads
 	half = q.shape[2]//2
 	h1 = nn.dot_product_attention(q[:, :, :half, :], k[:, :, :half, :], v[:, :, :half, :])
 	h2 = nn.dot_product_attention(q[:, :, half:, :], k[:, :, half:, :], v[:, :, half:, :])
@@ -130,6 +138,7 @@ class AttnBlock(nn.Module):
 
 	num_heads: Optional[int]
 	head_dim: Optional[int]
+	param_dtype: Optional[Any] = jnp.float32
 
 	@nn.compact
 	def __call__(self, x):
@@ -150,9 +159,9 @@ class AttnBlock(nn.Module):
 
 		assert h.shape == (B, H, W, C)
 		h = h.reshape(B, H * W, C)
-		q = nn.DenseGeneral(features=(num_heads, head_dim), name='q')(h)
-		k = nn.DenseGeneral(features=(num_heads, head_dim), name='k')(h)
-		v = nn.DenseGeneral(features=(num_heads, head_dim), name='v')(h)
+		q = nn.DenseGeneral(features=(num_heads, head_dim), name='q', param_dtype=self.param_dtype)(h)
+		k = nn.DenseGeneral(features=(num_heads, head_dim), name='k', param_dtype=self.param_dtype)(h)
+		v = nn.DenseGeneral(features=(num_heads, head_dim), name='v', param_dtype=self.param_dtype)(h)
 		assert q.shape == k.shape == v.shape == (B, H * W, num_heads, head_dim)
 		h = lowmem_dot_product_attention(q, k, v)
 		assert h.shape == (B, H * W, num_heads, head_dim)
@@ -160,7 +169,7 @@ class AttnBlock(nn.Module):
 				features=C,
 				axis=(-2, -1),
 				kernel_init=nn.initializers.zeros,
-				name='proj_out')(h)
+				name='proj_out', param_dtype=self.param_dtype)(h)
 		assert h.shape == (B, H * W, C)
 		h = h.reshape(B, H, W, C)
 		assert h.shape == x.shape
@@ -188,6 +197,7 @@ class UNet(nn.Module):
 
 	resblock_resample: bool = False
 	head_dim: Optional[int] = None  # alternative to num_heads
+	param_dtype: Any = 'fp32'
 
 	@nn.compact
 	def __call__(self, x, logsnr, y, *, train):
@@ -214,6 +224,13 @@ class UNet(nn.Module):
 		else:
 			raise NotImplementedError(self.logsnr_input_type)
 
+		if self.param_dtype == 'fp32':
+			param_dtype = jnp.float32
+		else:
+			param_dtype = jnp.bfloat16
+		
+		print("PARAM DTYPE:", param_dtype)
+
 		emb = get_timestep_embedding(logsnr_input, embedding_dim=ch, max_time=1.)
 		emb = nn.Dense(features=emb_ch, name='dense0')(emb)
 		emb = nn.Dense(features=emb_ch, name='dense1')(nonlinearity(emb))
@@ -233,34 +250,40 @@ class UNet(nn.Module):
 		del y
 
 		# Downsampling
+		emb = emb.astype(param_dtype)
+
 		hs = [nn.Conv(
 				features=ch, kernel_size=(3, 3), strides=(1, 1), name='conv_in')(x)]
+		hs= [hs[0].astype(param_dtype)]
+
 		for i_level in range(num_resolutions):
 			# Residual blocks for this resolution
 			for i_block in range(self.num_res_blocks):
 				h = ResnetBlock(
 						out_ch=ch * self.ch_mult[i_level],
 						dropout=self.dropout,
-						name=f'down_{i_level}.block_{i_block}')(
+						name=f'down_{i_level}.block_{i_block}',
+						param_dtype=param_dtype)(
 								hs[-1], emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
 					h = AttnBlock(
 							num_heads=self.num_heads,
 							head_dim=self.head_dim,
-							name=f'down_{i_level}.attn_{i_block}')(h)
+							name=f'down_{i_level}.attn_{i_block}',
+							param_dtype=param_dtype)(h)
 				hs.append(h)
 			# Downsample
 			if i_level != num_resolutions - 1:
 				hs.append(self._downsample(
-						hs[-1], name=f'down_{i_level}.downsample', emb=emb, train=train))
+						hs[-1], name=f'down_{i_level}.downsample', emb=emb, train=train, param_dtype=param_dtype))
 
 		# Middle
 		h = hs[-1]
-		h = ResnetBlock(dropout=self.dropout, name='mid.block_1')(
+		h = ResnetBlock(dropout=self.dropout, name='mid.block_1', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
 		h = AttnBlock(
-				num_heads=self.num_heads, head_dim=self.head_dim, name='mid.attn_1')(h)
-		h = ResnetBlock(dropout=self.dropout, name='mid.block_2')(
+				num_heads=self.num_heads, head_dim=self.head_dim, name='mid.attn_1', param_dtype=param_dtype)(h)
+		h = ResnetBlock(dropout=self.dropout, name='mid.block_2', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
 
 		# Upsampling
@@ -270,50 +293,54 @@ class UNet(nn.Module):
 				h = ResnetBlock(
 						out_ch=ch * self.ch_mult[i_level],
 						dropout=self.dropout,
-						name=f'up_{i_level}.block_{i_block}')(
+						name=f'up_{i_level}.block_{i_block}', 
+                        param_dtype=param_dtype)(
 								jnp.concatenate([h, hs.pop()], axis=-1),
 								emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
 					h = AttnBlock(
 							num_heads=self.num_heads,
 							head_dim=self.head_dim,
-							name=f'up_{i_level}.attn_{i_block}')(h)
+							name=f'up_{i_level}.attn_{i_block}', 
+                            param_dtype=param_dtype)(h)
 			# Upsample
 			if i_level != 0:
 				h = self._upsample(
-						h, name=f'up_{i_level}.upsample', emb=emb, train=train)
+						h, name=f'up_{i_level}.upsample', emb=emb, train=train, param_dtype=param_dtype)
 		assert not hs
 
 		# End
 		h = nonlinearity(Normalize(name='norm_out')(h))
+		least_multof8 = int(onp.ceil(self.out_ch/8) * 8) #force output to have 8 channels to allow sharding across the 8 cores. then discard the extra channels.
 		h = nn.Conv(
-				features=self.out_ch,
+				features=least_multof8,
 				kernel_size=(3, 3),
 				strides=(1, 1),
 				kernel_init=nn.initializers.zeros,
-				name='conv_out')(h)
+				name='conv_out')(h.astype('float32'))[..., :self.out_ch]
+
 		assert h.shape == (*x.shape[:3], self.out_ch)
 		return h
 
-	def _downsample(self, x, *, name, emb, train):
+	def _downsample(self, x, *, name, emb, train, param_dtype=jnp.float32):
 		B, H, W, C = x.shape  # pylint: disable=invalid-name
 		if self.resblock_resample:
 			x = ResnetBlock(
-					dropout=self.dropout, resample='down', name=name)(
+					dropout=self.dropout, resample='down', name=name, param_dtype=param_dtype)(
 							x, emb=emb, deterministic=not train)
 		else:
-			x = nn.Conv(features=C, kernel_size=(3, 3), strides=(2, 2), name=name)(x)
+			x = nn.Conv(features=C, kernel_size=(3, 3), strides=(2, 2), name=name, param_dtype=param_dtype)(x)
 		assert x.shape == (B, H // 2, W // 2, C)
 		return x
 
-	def _upsample(self, x, *, name, emb, train):
+	def _upsample(self, x, *, name, emb, train, param_dtype=jnp.float32):
 		B, H, W, C = x.shape  # pylint: disable=invalid-name
 		if self.resblock_resample:
 			x = ResnetBlock(
-					dropout=self.dropout, resample='up', name=name)(
+					dropout=self.dropout, resample='up', name=name, param_dtype=param_dtype)(
 							x, emb=emb, deterministic=not train)
 		else:
 			x = nearest_neighbor_upsample(x)
-			x = nn.Conv(features=C, kernel_size=(3, 3), strides=(1, 1), name=name)(x)
+			x = nn.Conv(features=C, kernel_size=(3, 3), strides=(1, 1), name=name, param_dtype=param_dtype)(x)
 		assert x.shape == (B, H * 2, W * 2, C)
 		return x

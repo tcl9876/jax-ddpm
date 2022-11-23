@@ -10,7 +10,7 @@ from absl import app, flags
 from ml_collections.config_flags import config_flags
 from jax_modules.checkpoints import restore_checkpoint
 from jax_modules.unet import UNet
-from jax_modules.utils import save_tiled_imgs
+from jax_modules.utils import save_tiled_imgs, to_fp32
 from tqdm.auto import tqdm
 import diffusers
 from diffusion.flax_pipeline import FlaxGeneralDiffusionPipeline 
@@ -60,8 +60,9 @@ def main(_):
     step = restored_sd["step"]
     print(f"Restored Checkpoint from {step} steps")
 
+    #TODO: fix checkpoint, restore from ema_params, remove magic number args.height = 256
     params = {
-        "unet": restored_sd["ema_params"],
+        "unet": to_fp32(restored_sd["params"]),
         "scheduler": scheduler_state
     }
 
@@ -71,10 +72,10 @@ def main(_):
     unet = UNet(**config.model.args, num_classes=num_classes)
     setattr(unet, 'in_channels', unet.out_ch) #force overwrite for now, will be unneeded when using diffusers unet
 
-    if args.height == 256:
+    if args.height == 256: 
         stable_pipe, stable_params = OriginalStablePipeline.from_pretrained("CompVis/stable-diffusion-v1-4", revision="bf16", use_auth_token=args.auth_token)
         vae, vae_params = stable_pipe.vae, stable_params["vae"]
-        vae_params = jax.tree_util.tree_map(lambda x: x.astype('float32'), vae_params) #diffusers doesn't like loading w/o bf16
+        vae_params = to_fp32(vae_params) #diffusers doesn't like loading w/o bf16
         params["vae"] = vae_params
         del stable_params["unet"]
     else:
