@@ -206,36 +206,6 @@ class Trainer:
 			)
 		
 		return update_fn
-	
-	"""
-	def state_dict(self, state):
-		#returns a saveable dict of params, ema_params and optimizer_state that's stored on the CPU and is fully unsharded.
-		cpu = lambda x: utils.unreplicate(x)
-		return {
-			"step": state.step,
-			"params": cpu(unshard_pytree(state.sharded_params)),
-			"ema_params": cpu(unshard_pytree(state.ema_params)),
-			"optimizer_state": cpu(unshard_pytree(state.optimizer_state))
-		}
-
-	def load_state_dict(self, state_dict):
-		if state_dict is None:
-			print("No restored state dict.")
-			return None
-
-		self.step = replicate(jnp.int32(state_dict["step"]))
-		self.params = replicate(state_dict["params"])
-		self.optimizer.ema_params = local_shard_pytree(replicate(state_dict["ema_params"]))
-		self.optimizer.optimizer_state = local_shard_pytree(replicate(state_dict["optimizer_state"]))
-
-		return TrainState(
-			step=replicate(jnp.int32(state_dict["step"])),
-			params=replicate(utils.to_bf16(state_dict["params"])),
-			sharded_params=local_shard_pytree(replicate(state_dict["params"])),
-			optimizer_state=local_shard_pytree(replicate(state_dict["optimizer_state"])),
-			ema_params=local_shard_pytree(replicate(state_dict["ema_params"]))
-		)
-	"""
 		
 
 class MeanObject(object):
