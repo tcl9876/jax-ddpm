@@ -24,7 +24,8 @@ from absl import logging
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
-import numpy as onp
+import numpy as np
+from .attention import FlaxTransformer2DModel, SequenceProcessor
 
 nonlinearity = nn.swish
 
@@ -58,7 +59,7 @@ def get_timestep_embedding(timesteps, embedding_dim,
 	timesteps *= (1000. / max_time)
 
 	half_dim = embedding_dim // 2
-	emb = onp.log(10000) / (half_dim - 1)
+	emb = np.log(10000) / (half_dim - 1)
 	emb = jnp.exp(jnp.arange(half_dim, dtype=dtype) * -emb)
 	emb = timesteps.astype(dtype)[:, None] * emb[None, :]
 	emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=1)
@@ -67,6 +68,22 @@ def get_timestep_embedding(timesteps, embedding_dim,
 	assert emb.shape == (timesteps.shape[0], embedding_dim)
 	return emb
 
+#2d positional embedding like ViT. adapted from https://github.com/ericl122333/PatchDiffusion-Pytorch/blob/main/patch_diffusion/nn.py
+def timestep_embedding_2d(dim, resolution):
+    omega = 64 / resolution   #higher resolutions need longer wavelengths
+    half_dim = dim // 2
+    arange = jnp.arange(resolution, dtype=jnp.float32)
+
+    emb = (np.log(10000) / (half_dim - 1))
+    emb = jnp.exp(jnp.arange(half_dim, dtype=jnp.float32) * -emb)
+    
+    emb = arange[:, None] * emb[None, :]
+    emb = jnp.sin(emb * omega)
+    
+    emb_x = jnp.repeat(emb[None, ...], resolution, axis=0)
+    emb_y = jnp.repeat(emb[:, None, :], resolution, axis=1)
+    emb = jnp.concatenate([emb_x, emb_y], axis=-1)
+    return emb[None, ...]
 
 def nearest_neighbor_upsample(x):
 	B, H, W, C = x.shape  # pylint: disable=invalid-name
@@ -120,69 +137,50 @@ class ResnetBlock(nn.Module):
 			x = nn.Dense(features=out_ch, name='nin_shortcut', param_dtype=self.param_dtype)(x)
 
 		assert x.shape == h.shape
-		logging.info(
-				'%s: x=%r emb=%r resample=%r',
-				self.name, x.shape, emb.shape, self.resample)
 		return x + h
 
-@jax.checkpoint
-def lowmem_dot_product_attention(q, k, v):
-	#TODO: maybe convert to a jax.lax.fori_loop over the heads
-	half = q.shape[2]//2
-	h1 = nn.dot_product_attention(q[:, :, :half, :], k[:, :, :half, :], v[:, :, :half, :])
-	h2 = nn.dot_product_attention(q[:, :, half:, :], k[:, :, half:, :], v[:, :, half:, :])
-	return jnp.concatenate((h1, h2), axis=2).astype(jnp.float32)
+class UNetTextConditioned(nn.Module):
+	"""The UNet architecture w/ t5 and clip encoding handling."""
 
-class AttnBlock(nn.Module):
-	"""Self-attention residual block."""
+	ch: int
+	emb_ch: int
+	out_ch: int
+	seq_width: int
+	ch_mult: Tuple[int]
+	num_res_blocks: int
+	attn_resolutions: Tuple[int]
+	dropout: float
+	logsnr_input_type: str
 
-	num_heads: Optional[int]
-	head_dim: Optional[int]
-	param_dtype: Optional[Any] = jnp.float32
+	num_heads: Optional[int] = None
+	logsnr_scale_range: Tuple[float, float] = (-10., 10.)
+	resblock_resample: bool = False
+	head_dim: Optional[int] = None  # alternative to num_heads
+	param_dtype: Any = 'fp32'
 
-	@nn.compact
-	def __call__(self, x):
-		B, H, W, C = x.shape  # pylint: disable=invalid-name,unused-variable
-
-		if self.head_dim is None:
-			assert self.num_heads is not None
-			assert C % self.num_heads == 0
-			num_heads = self.num_heads
-			head_dim = C // num_heads
-		else:
-			assert self.num_heads is None
-			assert C % self.head_dim == 0
-			head_dim = self.head_dim
-			num_heads = C // head_dim
-
-		h = Normalize(name='norm')(x)
-
-		assert h.shape == (B, H, W, C)
-		h = h.reshape(B, H * W, C)
-		q = nn.DenseGeneral(features=(num_heads, head_dim), name='q', param_dtype=self.param_dtype)(h)
-		k = nn.DenseGeneral(features=(num_heads, head_dim), name='k', param_dtype=self.param_dtype)(h)
-		v = nn.DenseGeneral(features=(num_heads, head_dim), name='v', param_dtype=self.param_dtype)(h)
-		assert q.shape == k.shape == v.shape == (B, H * W, num_heads, head_dim)
-		h = lowmem_dot_product_attention(q, k, v)
-		assert h.shape == (B, H * W, num_heads, head_dim)
-		h = nn.DenseGeneral(
-				features=C,
-				axis=(-2, -1),
-				kernel_init=nn.initializers.zeros,
-				name='proj_out', param_dtype=self.param_dtype)(h)
-		assert h.shape == (B, H * W, C)
-		h = h.reshape(B, H, W, C)
-		assert h.shape == x.shape
-		logging.info(
-				'%s: x=%r num_heads=%d head_dim=%d',
-				self.name, x.shape, num_heads, head_dim)
-		return x + h
+	def setup(self):
+		
+		self.unet = UNet(
+			ch=self.ch, emb_ch=self.emb_ch, out_ch=self.out_ch, 
+			ch_mult=self.ch_mult, num_res_blocks=self.num_res_blocks, attn_resolutions=self.attn_resolutions,
+			num_heads=self.num_heads, dropout=self.dropout, logsnr_input_type=self.logsnr_input_type, logsnr_scale_range=self.logsnr_scale_range,
+			resblock_resample=self.resblock_resample, head_dim=self.head_dim, param_dtype=self.param_dtype
+		)
+		self.text_processor = SequenceProcessor(seq_width=self.seq_width)
+	
+	def prepare_uncond_conditioning(self, context):
+		for key in ["clip_emb", "t5_emb"]:
+			context[key] = jnp.zeros_like(context[key])
+		return self.text_processor(clip_seq=context["clip_emb"], t5_seq=context["t5_emb"]).astype(self.param_dtype)
+		
+	def __call__(self, x, logsnr, context, *, train):
+		context = self.text_processor(clip_seq=context["clip_emb"], t5_seq=context["t5_emb"])
+		return self.unet(x, logsnr, context, train=train)
 
 
 class UNet(nn.Module):
-	"""A UNet architecture."""
+	"""The UNet architecture , with x-attn but without sequence embedding related things (it expects the processed sequence for context) """
 
-	num_classes: int
 	ch: int
 	emb_ch: int
 	out_ch: int
@@ -200,7 +198,7 @@ class UNet(nn.Module):
 	param_dtype: Any = 'fp32'
 
 	@nn.compact
-	def __call__(self, x, logsnr, y, *, train):
+	def __call__(self, x, logsnr, context, *, train):
 		B, H, W, _ = x.shape  # pylint: disable=invalid-name
 		assert H == W
 		assert x.dtype in (jnp.float32, jnp.float64)
@@ -219,7 +217,7 @@ class UNet(nn.Module):
 			logsnr_input = nn.sigmoid(logsnr)
 		elif self.logsnr_input_type == 'inv_cos':
 			logging.info('LogSNR representation: inverse cosine')
-			logsnr_input = (jnp.arctan(jnp.exp(-0.5 * jnp.clip(logsnr, -20., 20.)))
+			logsnr_input = (jnp.arctan(jnp.exp(-0.5 * jnp.clip(logsnr, -15., 15.)))
 											/ (0.5 * jnp.pi))
 		else:
 			raise NotImplementedError(self.logsnr_input_type)
@@ -236,26 +234,16 @@ class UNet(nn.Module):
 		emb = nn.Dense(features=emb_ch, name='dense1')(nonlinearity(emb))
 		assert emb.shape == (B, emb_ch)
 
-		# Class embedding
-		assert self.num_classes >= 1
-		if self.num_classes > 1:
-			logging.info('conditional: num_classes=%d', self.num_classes)
-			assert y.shape == (B,) and y.dtype == jnp.int32
-			y_emb = jax.nn.one_hot(y, num_classes=self.num_classes, dtype=x.dtype)
-			y_emb = nn.Dense(features=emb_ch, name='class_emb')(y_emb)
-			assert y_emb.shape == emb.shape == (B, emb_ch)
-			emb += y_emb
-		else:
-			logging.info('unconditional: num_classes=%d', self.num_classes)
-		del y
-
-		# Downsampling
 		emb = emb.astype(param_dtype)
-
+		context = context.astype(param_dtype)
+		
 		hs = [nn.Conv(
 				features=ch, kernel_size=(3, 3), strides=(1, 1), name='conv_in')(x)]
-		hs= [hs[0].astype(param_dtype)]
+		pe = timestep_embedding_2d(ch, x.shape[1])
+		assert pe.shape[1:] == hs[0].shape[1:]
+		hs= [hs[0].astype(param_dtype) + pe.astype(param_dtype)]
 
+		# Downsampling
 		for i_level in range(num_resolutions):
 			# Residual blocks for this resolution
 			for i_block in range(self.num_res_blocks):
@@ -266,11 +254,12 @@ class UNet(nn.Module):
 						param_dtype=param_dtype)(
 								hs[-1], emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
-					h = AttnBlock(
-							num_heads=self.num_heads,
-							head_dim=self.head_dim,
-							name=f'down_{i_level}.attn_{i_block}',
-							param_dtype=param_dtype)(h)
+					h = FlaxTransformer2DModel(
+							in_channels=h.shape[-1], 
+							n_heads=h.shape[-1]//self.head_dim, 
+							d_head=self.head_dim, 
+							only_cross_attention=(i_level == 0),
+							param_dtype=param_dtype)(h, context)
 				hs.append(h)
 			# Downsample
 			if i_level != num_resolutions - 1:
@@ -281,8 +270,8 @@ class UNet(nn.Module):
 		h = hs[-1]
 		h = ResnetBlock(dropout=self.dropout, name='mid.block_1', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
-		h = AttnBlock(
-				num_heads=self.num_heads, head_dim=self.head_dim, name='mid.attn_1', param_dtype=param_dtype)(h)
+		h = FlaxTransformer2DModel(
+				in_channels=h.shape[-1], n_heads=h.shape[-1]//self.head_dim, d_head=self.head_dim, param_dtype=param_dtype)(h, context)
 		h = ResnetBlock(dropout=self.dropout, name='mid.block_2', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
 
@@ -298,11 +287,12 @@ class UNet(nn.Module):
 								jnp.concatenate([h, hs.pop()], axis=-1),
 								emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
-					h = AttnBlock(
-							num_heads=self.num_heads,
-							head_dim=self.head_dim,
-							name=f'up_{i_level}.attn_{i_block}', 
-                            param_dtype=param_dtype)(h)
+					h = FlaxTransformer2DModel(
+							in_channels=h.shape[-1], 
+							n_heads=h.shape[-1]//self.head_dim, 
+							d_head=self.head_dim, 
+							only_cross_attention=(i_level == 0),
+							param_dtype=param_dtype)(h, context)
 			# Upsample
 			if i_level != 0:
 				h = self._upsample(
@@ -311,7 +301,7 @@ class UNet(nn.Module):
 
 		# End
 		h = nonlinearity(Normalize(name='norm_out')(h))
-		least_multof8 = int(onp.ceil(self.out_ch/8) * 8) #force output to have 8 channels to allow sharding across the 8 cores. then discard the extra channels.
+		least_multof8 = int(np.ceil(self.out_ch/8) * 8) #force output to have 8 channels to allow sharding across the 8 cores. then discard the extra channels.
 		h = nn.Conv(
 				features=least_multof8,
 				kernel_size=(3, 3),

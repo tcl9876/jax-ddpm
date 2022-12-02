@@ -27,6 +27,7 @@ import numpy as onp
 import PIL
 from tensorflow.io import gfile
 import time
+import transformers
 
 def unreplicate(x):
     return jax.device_get(flax.jax_utils.unreplicate(x))
@@ -252,6 +253,9 @@ def count_params(pytree):
 def copy_pytree(pytree):
 	return jax.tree_map(jnp.array, pytree)
 
+def zero_pytree(pytree):
+	return jax.tree_map(jnp.zeros_like, pytree)
+
 
 def global_norm(pytree):
 	return jnp.sqrt(jnp.sum(jnp.asarray(
@@ -315,3 +319,9 @@ def broadcast_from_left(x, shape):
 	return jnp.broadcast_to(
 			x.reshape(x.shape + (1,) * (len(shape) - x.ndim)),
 			shape)
+
+def list_devices():
+	if jax.process_index() == 0:
+		print("DEVICES: ", jax.devices())
+	else:
+		print(f"global device count: {jax.device_count()}, device count on node {jax.process_index()}: {jax.local_device_count}")

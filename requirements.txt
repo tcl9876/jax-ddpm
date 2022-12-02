@@ -8,3 +8,5 @@ ml_collections
 clu
 diffusers==0.7.0
 transformers
+accelerate
+ftfy

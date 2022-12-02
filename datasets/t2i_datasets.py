@@ -11,11 +11,14 @@ def read_encoded(example):
         "t5_emb": tf.io.FixedLenFeature([], tf.string),
     }
     example = tf.io.parse_single_example(example, features)
-
+    
     for key in features.keys():
         example[key] = tf.io.parse_tensor(example[key], tf.bfloat16)
         example[key] = tf.cast(example[key], tf.float32)
-
+    
+    example["image"] = tf.transpose(example["latents"], [2, 0, 1]) #TODO: see about removing the transpose by fixing dataset encoder builder.
+    del example["latents"]
+    
     for key in ["clip_emb", "t5_emb"]:
         example[key] = tf.concat([example[key], tf.zeros([77, 1024], dtype=tf.float32)], axis=0)[:77] #zero pad to 77
 
@@ -51,10 +54,11 @@ def make_encoders_fn(vae, clip_text_module, t5_module):
 
     return encoders_fn
 
-def build_tfrecord_dataset(tfrecord_dir, batch_size, map_fn, process_index, process_count):
+def build_tfrecord_dataset(tfrecord_dir, batch_sizes, map_fn, process_index, process_count):
     filenames = gfile.glob(os.path.join(tfrecord_dir, '*.tfrecord'))
     dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=tf.data.AUTOTUNE).map(map_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.shard(index=process_index, num_shards=process_count)
-    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE) #batch_size%local_device_count must be 0
-    dataset = numpy_iter(dataset)
+    dataset = dataset.shard(index=process_index, num_shards=process_count).repeat()
+    for batch_size in batch_sizes:
+        dataset = dataset.batch(batch_size)
+    dataset = numpy_iter(dataset.prefetch(tf.data.AUTOTUNE))
     return dataset

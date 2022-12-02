@@ -41,10 +41,6 @@ def print_and_log(*args, logfile_path):
 def main(_):
     list_devices()
 
-    filenames = gfile.glob(os.path.join(args.data_dir, '*.tfrecord'))
-    full_image_dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=tf.data.AUTOTUNE).map(read_pixels).batch(args.batch_size)
-    full_image_dataset = numpy_iter(full_image_dataset)
-
     stable_pipeline, stable_params = FlaxStableDiffusionPipeline.from_pretrained(
         "CompVis/stable-diffusion-v1-4", revision="flax", dtype=jnp.bfloat16
     )
@@ -70,7 +66,7 @@ def main(_):
 
     encoders_fn = make_encoders_fn(vae, clip_text_module, t5_module)
     encoders_fn = jax.pmap(encoders_fn)
-    full_image_dataset = build_tfrecord_dataset(args.data_dir, batch_size=args.batch_size, map_fn=read_pixels, process_index=jax.process_index(), process_count=jax.process_count())
+    full_image_dataset = build_tfrecord_dataset(args.data_dir, batch_sizes=[args.batch_size], map_fn=read_pixels, process_index=jax.process_index(), process_count=jax.process_count())
 
     logfile_path = os.path.join(args.write_dir, 'logfile.txt')
     if not gfile.exists(logfile_path) and jax.process_index() == 0:
