@@ -27,6 +27,7 @@ class LN32(nn.Module):
 		normx_32 = nn.normalization.LayerNorm(epsilon=1e-5)(x.astype('float32'))
 		return normx_32.astype(x_dtype)
 
+#TODO: move within unet and remove unettextconditioned maybe?
 class SequenceProcessor(nn.Module):
     seq_width: Optional[int] = 256
     @nn.compact

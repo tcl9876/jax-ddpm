@@ -6,7 +6,7 @@ pillow
 flax==0.5.3
 ml_collections
 clu
-diffusers==0.7.0
+diffusers==0.8.0
 transformers
 accelerate
 ftfy

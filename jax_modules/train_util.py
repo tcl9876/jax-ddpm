@@ -136,7 +136,6 @@ class Trainer:
 			context[key] = label
 
 		def model_fn(x, logsnr):
-			
 			return self.model.apply(
 				{'params': params}, x=x, logsnr=logsnr, context=context, train=train,
 				rngs={'dropout': next(rng)} if train else None)

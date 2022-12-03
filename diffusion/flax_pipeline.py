@@ -1,3 +1,17 @@
+# Copyright 2022 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import warnings
 from functools import partial
 from typing import Dict, List, Optional, Union, Any
@@ -137,7 +151,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
 
     def _generate(
         self,
-        prompt_ids: jnp.array,
+        context: Dict,
         params: Union[Dict, FrozenDict],
         prng_seed: Optional[jax.random.PRNGKey],
         num_inference_steps: int = 50,
@@ -147,7 +161,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
         latents: Optional[jnp.array] = None,
         debug: bool = False,
     ):
-        batch_size = len(prompt_ids) #prompt_ids.shape[0]
+        batch_size = len(context["clip_emb"]) #prompt_ids.shape[0]
         if self.vae is not None:
             if height % 8 != 0 or width % 8 != 0:
                 raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
@@ -155,21 +169,8 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
         else:
             latents_shape = (batch_size, 3, height, width)
 
-        if self.text_encoder is not None: #allow None text encoder for class-conditional or unconditional
-            # get prompt text embeddings
-            text_embeddings = self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
-
-            max_length = prompt_ids.shape[-1]
-            uncond_input = self.tokenizer(
-                [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="np"
-            )
-            uncond_embeddings = self.text_encoder(uncond_input.input_ids, params=params["text_encoder"])[0]
-            context = jnp.concatenate([uncond_embeddings, text_embeddings])
-        else:
-            context = prompt_ids #prompt_ids in this case is class label, not text label.
-            if isinstance(context, jnp.ndarray):
-                uncond_context = jnp.full_like(context, self.unet.num_classes, dtype=jnp.int32)
-                context = jnp.concatenate([uncond_context, context], axis=0)
+        for key in ["clip_emb", "t5_emb"]:
+            context[key] = jnp.concatenate([jnp.zeros_like(context[key]), context[key]], axis=0)
 
         if latents is None:
             latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
@@ -178,7 +179,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
                 raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}")
 
         model_fn = lambda x, logsnr: self.unet.apply(
-			{'params': params["unet"]}, x=x, logsnr=logsnr, y=context, train=False) #TODO: allow for label and text input.
+			{'params': params["unet"]}, x=x, logsnr=logsnr, context=context, train=False) #TODO: allow for label and text input.
         
         margs = self.model_config
         model_wrap = DiffusionWrapper(
