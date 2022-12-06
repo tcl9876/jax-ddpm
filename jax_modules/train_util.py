@@ -24,12 +24,11 @@
 import functools
 from typing import Any, Union
 
-from datasets import datasets
 from diffusion.dpm import DiffusionWrapper
 from diffusion.schedules import get_logsnr_schedule
 from .unet import UNetTextConditioned
 from . import utils
-from .optimizer import make_adam, shard_pytree, unshard_pytree
+from .optimizer import make_adam, unshard_pytree
 from absl import logging
 import flax
 import jax
@@ -37,9 +36,56 @@ import jax.numpy as jnp
 import optax
 from flax.jax_utils import replicate, unreplicate
 
+#are all the nones needed? todo for later
+@jax.jit
+def replace_params(state, new_params):
+	state = state.replace(params=None)
+	return state.replace(
+		step=state.step + 1,
+		accum_step=0,
+		params=new_params
+	)
 
-local_shard_pytree = jax.pmap(shard_pytree, axis_name='i', devices=jax.local_devices())
-#local_unshard_pytree = jax.pmap(unshard_pytree, axis_name='i', devices=jax.local_devices())
+@jax.jit
+def replace_sharded_params(state, new_sharded_params):
+	state = state.replace(sharded_params=None)
+	return state.replace(sharded_params=new_sharded_params)
+
+@jax.jit
+def replace_ema_params(state, new_ema_params):
+	state = state.replace(ema_params=None)
+	return state.replace(ema_params=new_ema_params)
+
+@jax.jit
+def replace_opt(state, new_opt_state):
+	state = state.replace(optimizer_state=None)
+	return state.replace(optimizer_state=new_opt_state)
+
+@jax.jit
+def zero_accum_grad(state):
+	return state.replace(accum_grad=utils.zero_pytree(state.accum_grad))
+
+def move_to_last_axis(pytree, mul=2):
+	def movefn(x):
+		xshape = x.shape
+		if len(xshape) >= 2 and xshape[-1] * x.shape[-2] > 16384:
+			newshape = list(xshape[:-2]) + [x.shape[-2] //mul, x.shape[-1]*mul]
+			return jnp.reshape(x, newshape)
+		else:
+			return x
+	return jax.tree_map(lambda a: movefn(a), pytree)
+
+def move_from_last_axis(pytree, mul=2):
+	def movefn(x):
+		xshape = x.shape
+		if len(xshape) >= 2 and xshape[-1] * x.shape[-2] > 16384:
+			newshape = list(xshape[:-2]) + [x.shape[-2] *mul, x.shape[-1] //mul]
+			return jnp.reshape(x, newshape)
+		else:
+			return x
+	return jax.tree_map(lambda a: movefn(a), pytree)
+
+
 
 @flax.struct.dataclass
 class TrainState:
@@ -51,6 +97,24 @@ class TrainState:
 	optimizer_state: Any
 	ema_params: Any
 
+def get_single_pytree_shard(pytree, i, device_count=8):
+	def slicefn(x, i):
+		dim = x.shape[-1] // device_count
+		return x[..., dim*i:dim*i+dim]
+	return jax.tree_map(lambda a: slicefn(a, i), pytree)
+
+#this is working as intended, right? --> maybe test it
+def reshape_and_transpose(x):
+	shapelen = len(x.shape)
+	newshape = list(x.shape[:-1]) + [8, x.shape[-1] // 8]
+	x = jnp.reshape(x, newshape)
+	
+	#hwi8j -> 8hwij,  01234 -> 30124  shapelen 4
+	#8j -> 8j  01 -> 01 shapelen 1
+	#i8j -> 8ij  012 -> 102 shapelen 2
+	newperm = [shapelen-1] + list(range(shapelen-1)) + [shapelen]
+	x = jnp.transpose(x, newperm)
+	return x         
 
 class Trainer:
 	"""Diffusion model."""
@@ -61,8 +125,9 @@ class Trainer:
 		if dataset is not None:
 			self.dataset = dataset
 		else:
-			self.dataset = getattr(datasets, config.dataset.name)(
-				**config.dataset.args)
+			raise Exception('dataset must be provided')
+		#self.dataset = getattr(datasets, config.dataset.name)(
+		#	**config.dataset.args)
 
 		self._eval_step = None
 
@@ -75,6 +140,7 @@ class Trainer:
 			out_ch += x_ch
 
 		self.model = UNetTextConditioned(**config.model.args)
+		self.devices = jax.local_devices()
 
 	@property
 	def current_num_steps(self):
@@ -94,27 +160,52 @@ class Trainer:
 		# Init model params (same rng across hosts)
 		init_params = self.make_init_params(
 			global_rng=jax.random.PRNGKey(self.config.seed))
-		logging.info('Param shapes: {}'.format(
-			jax.tree_map(lambda a: a.shape, init_params)))
 		logging.info('Number of trainable parameters: {:,}'.format(
 			utils.count_params(init_params)))
 
-		init_params = replicate(init_params)
-		sharded_params = local_shard_pytree(utils.to_fp32(init_params))
-
-		ema_params = utils.copy_pytree(sharded_params)
+		self.device_count = len(self.devices)
+		param_shards = []
+		ema_param_shards = []
+		opt_shards = []
+		accum_grad_shards = []
 		self.tx = make_adam(self.config)
-		optimizer_state = replicate(self.tx.init(unreplicate(ema_params)))
-		self.update = self.make_update_fn()
 
+		for i in range(self.device_count):
+			print('p', i)
+			param_shard = get_single_pytree_shard(init_params, i, self.device_count)
+			param_shard = move_to_last_axis(param_shard)
+			param_shard = utils.to_fp32(param_shard)
+			param_shards.append(param_shard)
+		sharded_params = jax.device_put_sharded(param_shards, self.devices)
+
+		for i in range(self.device_count):
+			print('ema p', i)
+			ema_param_shards.append(utils.copy_pytree(param_shards[i]))
+		sharded_ema_params = jax.device_put_sharded(ema_param_shards, self.devices)
+		del ema_param_shards
+		
+		for i in range(self.device_count):
+			print('accum g', i)
+			accum_grad_shards.append(utils.zero_pytree(param_shards[i]))
+		sharded_accum_grads = jax.device_put_sharded(accum_grad_shards, self.devices)
+		del accum_grad_shards
+
+		for i in range(self.device_count):
+			print('o', i, 'len arr', len(param_shards))
+			opt_shards.append(self.tx.init(param_shards.pop(0)))
+		sharded_optimizer_states = jax.device_put_sharded(opt_shards, self.devices)
+		del opt_shards
+			
+		init_params = replicate(init_params)
+		#self.update = self.make_update_fn()
 		return TrainState(
 			step=replicate(0),
 			accum_step=replicate(0),
 			params=init_params,
 			sharded_params=sharded_params,
-			accum_grad=utils.zero_pytree(ema_params),
-			optimizer_state=optimizer_state,
-			ema_params=ema_params
+			accum_grad=sharded_accum_grads,
+			optimizer_state=sharded_optimizer_states,
+			ema_params=sharded_ema_params
 		)
 
 	def loss_fn(self, rng, train, batch, params):
@@ -136,6 +227,7 @@ class Trainer:
 			context[key] = label
 
 		def model_fn(x, logsnr):
+			
 			return self.model.apply(
 				{'params': params}, x=x, logsnr=logsnr, context=context, train=train,
 				rngs={'dropout': next(rng)} if train else None)
@@ -162,14 +254,14 @@ class Trainer:
 		loss_dict = {k: v.mean() for (k, v) in loss_dict.items()}
 		return loss_dict['loss'], loss_dict
 
-	def forward_backward(self, rng, batch, params):
+	def forward_backward(self, rng, batch, state, process_id):
 		rng = utils.RngGen(rng)
 
 		# Loss and gradient
 		loss_fn = functools.partial(self.loss_fn, next(rng), True, batch)
 
 		# Training mode
-		(_, metrics), grad = jax.value_and_grad(loss_fn, has_aux=True)(params)
+		(_, metrics), grad = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
 
 		# Average grad across shards after casting to fp32.
 		grad = utils.to_fp32(grad)
@@ -184,88 +276,50 @@ class Trainer:
 		metrics = {  # prepend prefix to names of metrics
 			f"train/{k}": v for k, v in metrics.items()
 		}
+		        
+		grad = jax.tree_map(lambda g: reshape_and_transpose(g)[process_id], grad)
+		grad = move_to_last_axis(grad)
 
-		return grad, metrics
+		new_accum_grad = jax.tree_map(
+			lambda x, y: x+y,
+			state.accum_grad, grad
+		)
+		#update accumulated gradient if&onlyif gradient is all finite (no inf/Nan)
+		'''all_finite = jnp.all(
+			jnp.array([jnp.all(jnp.isfinite(p)) for p in jax.tree_util.tree_flatten(new_accum_grad)[0]])
+		)
+		truefn = lambda state: state.replace(accum_grad=new_accum_grad, accum_step=state.accum_step+1)
+		falsefn = lambda state: state
+		state = jax.lax.cond(all_finite, truefn, falsefn, state)'''
+		state = state.replace(accum_grad=new_accum_grad, accum_step=state.accum_step+1)
+		return state, metrics
 	
-	def make_update_fn(self):
-			
-		def update_fn(state, grad):
+	def update_fn(self, state):
 			n_accums = self.config.train.n_accums
 
-			sharded_grad = shard_pytree(grad)
-			new_accum_grad = jax.tree_map(
-				lambda x, y: (x+y)/n_accums,
-				state.accum_grad, sharded_grad
+			#def update(state):
+			#apply adam update on sharded FP32 state, then downcast and unshard the fp32 model params.
+			updates, new_opt_state = self.tx.update(
+				state.accum_grad, state.optimizer_state, state.sharded_params
 			)
+			new_sharded_params = optax.apply_updates(state.sharded_params, updates)
 
-			#update accumulated gradient if&onlyif gradient is all finite (no inf/Nan)
-			all_finite = jnp.all(
-        		jnp.array([jnp.all(jnp.isfinite(p)) for p in jax.tree_util.tree_flatten(new_accum_grad)[0]])
-			)
-			truefn = lambda state: state.replace(accum_grad=new_accum_grad, accum_step=state.accum_step+1)
-			falsefn = lambda state: state
-			state = jax.lax.cond(all_finite, truefn, falsefn, state)
-			
-			def update(_):
-				#apply adam update on sharded FP32 state, then downcast and unshard the fp32 model params.
-				updates, new_opt_state = self.tx.update(
-					sharded_grad, state.optimizer_state, state.sharded_params
-				)
-				new_sharded_params = optax.apply_updates(state.sharded_params, updates)
-
-				new_ema_params = utils.apply_ema(self.config.train.ema_decay, 
+			new_ema_params = utils.apply_ema(self.config.train.ema_decay, 
 					avg=state.ema_params, new=new_sharded_params)
-				
-				casted_new_params = jax.tree_util.tree_map(
-					lambda x, y: x.astype(y.dtype),
-					new_sharded_params, state.params
-				)
-				new_params = unshard_pytree(casted_new_params)
-				return state.replace(
-					step=state.step + 1,
-					accum_step=0,
-					params=new_params,
-					sharded_params=new_sharded_params,
-					optimizer_state=new_opt_state,
-					ema_params=new_ema_params
-				)
 			
-			def do_nothing(_):
-				return state
-			
-			return jax.lax.cond(state.accum_step >= n_accums, update, do_nothing, operand=None)
+			casted_new_params = jax.tree_util.tree_map(
+				lambda x, y: x.astype(y.dtype),
+				new_sharded_params, state.params
+			)
+			casted_new_params = move_from_last_axis(casted_new_params)
+			new_params = unshard_pytree(casted_new_params)
 
-		return update_fn
-	
-	"""
-	def state_dict(self, state):
-		#returns a saveable dict of params, ema_params and optimizer_state that's stored on the CPU and is fully unsharded.
-		cpu = lambda x: utils.unreplicate(x)
-		return {
-			"step": state.step,
-			"params": cpu(unshard_pytree(state.sharded_params)),
-			"ema_params": cpu(unshard_pytree(state.ema_params)),
-			"optimizer_state": cpu(unshard_pytree(state.optimizer_state))
-		}
-
-	def load_state_dict(self, state_dict):
-		if state_dict is None:
-			print("No restored state dict.")
-			return None
-
-		self.step = replicate(jnp.int32(state_dict["step"]))
-		self.params = replicate(state_dict["params"])
-		self.optimizer.ema_params = local_shard_pytree(replicate(state_dict["ema_params"]))
-		self.optimizer.optimizer_state = local_shard_pytree(replicate(state_dict["optimizer_state"]))
-
-		return TrainState(
-			step=replicate(jnp.int32(state_dict["step"])),
-			params=replicate(utils.to_bf16(state_dict["params"])),
-			sharded_params=local_shard_pytree(replicate(state_dict["params"])),
-			optimizer_state=local_shard_pytree(replicate(state_dict["optimizer_state"])),
-			ema_params=local_shard_pytree(replicate(state_dict["ema_params"]))
-		)
-	"""
+			state = replace_params(state, new_params)
+			state = replace_sharded_params(state, new_sharded_params)
+			state = replace_ema_params(state, new_ema_params)
+			state = replace_opt(state, new_opt_state)
+			state = zero_accum_grad(state)
+			return state
 		
 
 class MeanObject(object):

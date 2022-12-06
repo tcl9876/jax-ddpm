@@ -25,9 +25,10 @@ from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-from .attention import FlaxTransformer2DModel, SequenceProcessor
+from .attention import FlaxTransformer2DModel, SequenceProcessor, FlaxGluFeedForward
 
-nonlinearity = nn.swish
+def nonlinearity(x):
+	return x * nn.sigmoid(1.702 * x)
 
 class Normalize(nn.Module):
 	name: str
@@ -92,7 +93,7 @@ def nearest_neighbor_upsample(x):
 	return x.reshape(B, H * 2, W * 2, C)
 
 
-class ResnetBlock(nn.Module):
+class ResnetBlockNoFFN(nn.Module):
 	"""Convolutional residual block."""
 
 	dropout: float
@@ -118,7 +119,7 @@ class ResnetBlock(nn.Module):
 				features=out_ch, kernel_size=(3, 3), strides=(1, 1), name='conv1', param_dtype=self.param_dtype)(h)
 
 		# add in timestep/class embedding
-		emb_out = nn.Dense(features=2 * out_ch, name='temb_proj', param_dtype=self.param_dtype)(
+		emb_out = nn.Dense(features=2 * out_ch, name='temb_proj', dtype=self.param_dtype, param_dtype=self.param_dtype)(
 				nonlinearity(emb))[:, None, None, :]
 		scale, shift = jnp.split(emb_out, 2, axis=-1)
 		h = Normalize(name='norm2')(h) * (1 + scale) + shift
@@ -134,10 +135,59 @@ class ResnetBlock(nn.Module):
 				param_dtype=self.param_dtype)(h)
 
 		if C != out_ch:
-			x = nn.Dense(features=out_ch, name='nin_shortcut', param_dtype=self.param_dtype)(x)
+			x = nn.Dense(features=out_ch, name='nin_shortcut', dtype=self.param_dtype, param_dtype=self.param_dtype)(x)
 
 		assert x.shape == h.shape
 		return x + h
+
+
+
+class ResnetBlock(nn.Module):
+	"""Convolutional residual block."""
+
+	dropout: float
+	out_ch: Optional[int] = None
+	resample: Optional[str] = None
+	param_dtype: Optional[Any] = jnp.float32
+
+	@nn.compact
+	def __call__(self, x, *, emb, deterministic):
+		B, _, _, C = x.shape  # pylint: disable=invalid-name
+		assert emb.shape[0] == B and len(emb.shape) == 2
+		out_ch = C if self.out_ch is None else self.out_ch
+		
+		h = nonlinearity(Normalize(name='norm1')(x))
+		if self.resample is not None:
+			updown = lambda z: {
+					'up': nearest_neighbor_upsample(z),
+					'down': nn.avg_pool(z, (2, 2), (2, 2))
+			}[self.resample]
+			h = updown(h)
+			x = updown(x)
+		h = nn.Conv(
+				features=out_ch, kernel_size=(3, 3), strides=(1, 1), name='conv1', dtype=self.param_dtype, param_dtype=self.param_dtype)(h)
+		
+		h = nonlinearity(Normalize(name='norm2')(h))
+		h = nn.Conv(
+				features=out_ch, kernel_size=(3, 3), strides=(1, 1), name='conv2', dtype=self.param_dtype, param_dtype=self.param_dtype)(h)
+
+		# add in timestep/class embedding
+		emb_out = nn.Dense(features=2 * out_ch, name='temb_proj', dtype=self.param_dtype, param_dtype=self.param_dtype)(
+				nonlinearity(emb))[:, None, None, :]
+		scale, shift = jnp.split(emb_out, 2, axis=-1)
+		h = Normalize(name='norm3')(h) * (1 + scale) + shift
+		# rest
+		h = nonlinearity(h)
+		h = nn.Dropout(rate=self.dropout)(h, deterministic=deterministic)
+
+		h = FlaxGluFeedForward(dim=out_ch, param_dtype=self.param_dtype)(h)
+
+		if C != out_ch:
+			x = nn.Dense(features=out_ch, name='nin_shortcut', dtype=self.param_dtype, param_dtype=self.param_dtype)(x)
+
+		assert x.shape == h.shape, f"{x.shape}, {h.shape}"
+		return x + h
+
 
 class UNetTextConditioned(nn.Module):
 	"""The UNet architecture w/ t5 and clip encoding handling."""
@@ -247,7 +297,7 @@ class UNet(nn.Module):
 		for i_level in range(num_resolutions):
 			# Residual blocks for this resolution
 			for i_block in range(self.num_res_blocks):
-				h = ResnetBlock(
+				h = nn.remat(ResnetBlock)(
 						out_ch=ch * self.ch_mult[i_level],
 						dropout=self.dropout,
 						name=f'down_{i_level}.block_{i_block}',
@@ -279,10 +329,10 @@ class UNet(nn.Module):
 		for i_level in reversed(range(num_resolutions)):
 			# Residual blocks for this resolution
 			for i_block in range(self.num_res_blocks + 1):
-				h = ResnetBlock(
+				h = nn.remat(ResnetBlock)(
 						out_ch=ch * self.ch_mult[i_level],
 						dropout=self.dropout,
-						name=f'up_{i_level}.block_{i_block}', 
+						name=f'up_{i_level}.block_{i_block}',
                         param_dtype=param_dtype)(
 								jnp.concatenate([h, hs.pop()], axis=-1),
 								emb=emb, deterministic=not train)
@@ -315,7 +365,7 @@ class UNet(nn.Module):
 	def _downsample(self, x, *, name, emb, train, param_dtype=jnp.float32):
 		B, H, W, C = x.shape  # pylint: disable=invalid-name
 		if self.resblock_resample:
-			x = ResnetBlock(
+			x = nn.remat(ResnetBlock)(
 					dropout=self.dropout, resample='down', name=name, param_dtype=param_dtype)(
 							x, emb=emb, deterministic=not train)
 		else:
@@ -326,7 +376,7 @@ class UNet(nn.Module):
 	def _upsample(self, x, *, name, emb, train, param_dtype=jnp.float32):
 		B, H, W, C = x.shape  # pylint: disable=invalid-name
 		if self.resblock_resample:
-			x = ResnetBlock(
+			x = nn.remat(ResnetBlock)(
 					dropout=self.dropout, resample='up', name=name, param_dtype=param_dtype)(
 							x, emb=emb, deterministic=not train)
 		else:

@@ -10,3 +10,7 @@ diffusers==0.8.0
 transformers
 accelerate
 ftfy
+tensorflow_io
+img2dataset
+gcsfs
+opencv-python

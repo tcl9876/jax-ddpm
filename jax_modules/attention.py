@@ -19,6 +19,10 @@ import numpy as np
 from functools import partial
 from typing import Optional
 
+
+def nonlinearity(x):
+	return x * nn.sigmoid(1.702 * x)
+
 class LN32(nn.Module):
     
 	@nn.compact
@@ -27,17 +31,15 @@ class LN32(nn.Module):
 		normx_32 = nn.normalization.LayerNorm(epsilon=1e-5)(x.astype('float32'))
 		return normx_32.astype(x_dtype)
 
-#TODO: move within unet and remove unettextconditioned maybe?
 class SequenceProcessor(nn.Module):
-    seq_width: Optional[int] = 256
+    seq_width: Optional[int] = 1024
     @nn.compact
     def __call__(self, clip_seq, t5_seq):
         """
         does several things:
         1) applies layernormalization + linear transformation separately to both, as t5 seq may have different variance, and they'll eventually be projected by the same weight matrices.
-        2) reshapes each seq from [B, S, C] to [B, S * (C//set_width), set_width], then concatenates the sequences.
-         - this reshape does 2 things: it lets the model spend more flops on cross attention, and it lets the model attend to different parts of the same word embedding.
-        3) appends a null embedding to the sequence, similar to https://arxiv.org/pdf/2211.01324.pdf. 
+        2) prepends a null embedding to the sequence, similar to https://arxiv.org/pdf/2211.01324.pdf. 
+        3) concatenates the sequences.
         """
         
         b, hc, ht5 = clip_seq.shape[0], clip_seq.shape[-1], t5_seq.shape[-1]
@@ -47,12 +49,9 @@ class SequenceProcessor(nn.Module):
             seq_width = self.seq_width
 
         assert hc%seq_width == 0 and ht5%seq_width == 0
-        clip_seq = nn.Dense(hc)(LN32()(clip_seq))
-        t5_seq = nn.Dense(ht5)(LN32()(t5_seq))
+        clip_seq = nn.Dense(seq_width)(LN32()(clip_seq))
+        t5_seq = nn.Dense(seq_width)(LN32()(t5_seq))
         
-        #maybe_hide_seq = jnp.greater(jax.random.uniform(rng, clip_seq.shape[:1]), drop_fraction).astype(jnp.float32) 
-        #clip_seq, t5_seq = clip_seq * np.squeeze(maybe_hide_seq), t5_seq * np.squeeze(maybe_hide_seq)
-        clip_seq, t5_seq = clip_seq.reshape(b, -1, seq_width), t5_seq.reshape(b, -1, seq_width)
         null_emb = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
         return jnp.concatenate([null_emb, clip_seq, t5_seq], axis=1)
 
@@ -124,11 +123,10 @@ class FlaxAttentionBlock(nn.Module):
         self.scale = self.dim_head**-0.5
 
         # Weights were exported with old names {to_q, to_k, to_v, to_out}
-        self.query = nn.Dense(inner_dim, use_bias=False, param_dtype=self.param_dtype, name="to_q")
-        self.key = nn.Dense(inner_dim, use_bias=False, param_dtype=self.param_dtype, name="to_k")
-        self.value = nn.Dense(inner_dim, use_bias=False, param_dtype=self.param_dtype, name="to_v")
+        self.query = nn.Dense(inner_dim, use_bias=False, dtype=self.param_dtype, param_dtype=self.param_dtype, name="to_q")
+        self.kv = nn.Dense(inner_dim*2, use_bias=False, dtype=self.param_dtype, param_dtype=self.param_dtype, name="to_kv")
 
-        self.proj_attn = nn.Dense(self.query_dim, param_dtype=self.param_dtype, name="to_out_0")
+        self.proj_attn = nn.Dense(self.query_dim, dtype=self.param_dtype, param_dtype=self.param_dtype, name="to_out_0")
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -150,8 +148,7 @@ class FlaxAttentionBlock(nn.Module):
         context = hidden_states if context is None else context
 
         query_proj = self.query(hidden_states)
-        key_proj = self.key(context)
-        value_proj = self.value(context)
+        key_proj, value_proj = jnp.split(self.kv(context), 2, axis=-1)
 
         query_states = self.reshape_heads_to_batch_dim(query_proj)
         key_states = self.reshape_heads_to_batch_dim(key_proj)
@@ -257,13 +254,14 @@ class FlaxTransformer2DModel(nn.Module):
 
         inner_dim = self.n_heads * self.d_head
         if self.use_linear_projection:
-            self.proj_in = nn.Dense(inner_dim, param_dtype=self.param_dtype)
+            self.proj_in = nn.Dense(inner_dim, dtype=self.param_dtype, param_dtype=self.param_dtype)
         else:
             self.proj_in = nn.Conv(
                 inner_dim,
                 kernel_size=(1, 1),
                 strides=(1, 1),
                 padding="VALID",
+                dtype=self.param_dtype,
                 param_dtype=self.param_dtype,
             )
 
@@ -280,13 +278,14 @@ class FlaxTransformer2DModel(nn.Module):
         ]
 
         if self.use_linear_projection:
-            self.proj_out = nn.Dense(inner_dim, param_dtype=self.param_dtype)
+            self.proj_out = nn.Dense(inner_dim, dtype=self.param_dtype, param_dtype=self.param_dtype)
         else:
             self.proj_out = nn.Conv(
                 inner_dim,
                 kernel_size=(1, 1),
                 strides=(1, 1),
                 padding="VALID",
+                dtype=self.param_dtype,
                 param_dtype=self.param_dtype,
             )
 
@@ -335,7 +334,7 @@ class FlaxGluFeedForward(nn.Module):
         # The second linear layer needs to be called
         # net_2 for now to match the index of the Sequential layer
         self.net_0 = FlaxGEGLU(self.dim, self.dropout, self.param_dtype)
-        self.net_2 = nn.Dense(self.dim, param_dtype=self.param_dtype)
+        self.net_2 = nn.Dense(self.dim, dtype=self.param_dtype, param_dtype=self.param_dtype)
 
     def __call__(self, hidden_states, deterministic=True):
         hidden_states = self.net_0(hidden_states)
@@ -361,9 +360,9 @@ class FlaxGEGLU(nn.Module):
 
     def setup(self):
         inner_dim = self.dim * 4
-        self.proj = nn.Dense(inner_dim * 2, param_dtype=self.param_dtype)
+        self.proj = nn.Dense(inner_dim * 2, dtype=self.param_dtype, param_dtype=self.param_dtype)
 
     def __call__(self, hidden_states, deterministic=True):
         hidden_states = self.proj(hidden_states)
-        hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=2)
-        return hidden_linear * nn.gelu(hidden_gelu)
+        hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
+        return hidden_linear * nonlinearity(hidden_gelu)

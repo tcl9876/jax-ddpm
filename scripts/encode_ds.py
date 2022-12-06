@@ -1,3 +1,7 @@
+import faulthandler
+
+faulthandler.enable()
+
 import tensorflow as tf
 import jax
 from tensorflow.io import gfile
@@ -8,7 +12,7 @@ import gc
 import jax.numpy as jnp
 import os
 from jax_modules.utils import numpy_iter, to_bf16, list_devices
-from datasets.t2i_datasets import make_encoders_fn, read_pixels, build_tfrecord_dataset
+from t2i_datasets.utils import make_encoders_fn, read_pixels, build_tfrecord_dataset
 from absl import app, flags
 import logging
 import transformers
@@ -66,7 +70,7 @@ def main(_):
 
     encoders_fn = make_encoders_fn(vae, clip_text_module, t5_module)
     encoders_fn = jax.pmap(encoders_fn)
-    full_image_dataset = build_tfrecord_dataset(args.data_dir, batch_sizes=[args.batch_size], map_fn=read_pixels, process_index=jax.process_index(), process_count=jax.process_count())
+    full_image_dataset = build_tfrecord_dataset(args.data_dir, batch_sizes=[args.batch_size], map_fn=read_pixels, process_index=jax.process_index(), process_count=jax.process_count(), repeating=False)
 
     logfile_path = os.path.join(args.write_dir, 'logfile.txt')
     if not gfile.exists(logfile_path) and jax.process_index() == 0:
@@ -79,15 +83,16 @@ def main(_):
         printl(_captions[:4])
         break
 
-    TFRECORD_MIN_EXAMPLES = 2000
+    TFRECORD_MIN_EXAMPLES = 5000
     
     all_latents, all_clip_embs, all_t5_embs = [], [], []
 
+    num_records = 0
     for image_pixels, captions in full_image_dataset:
         captions = [c.decode('utf-8') for c in captions]
         processed_images = image_pixels / 127.5 - 1.
-        clip_inputs = dict(clip_tokenizer(captions, return_tensors="np", max_length=77, padding='max_length'))
-        t5_inputs = dict(t5_tokenizer(captions, return_tensors="np", padding='max_length'))
+        clip_inputs = dict(clip_tokenizer(captions, truncation=True, return_tensors="np", max_length=77, padding='max_length'))
+        t5_inputs = dict(t5_tokenizer(captions, truncation=True, return_tensors="np", padding='max_length'))
 
         #reshape for pmap
         n = jax.local_device_count()
@@ -105,14 +110,20 @@ def main(_):
 
         for i in range(len(latents)):
             all_latents.append(latents[i])
-            clip_end = np.where(clip_mask[i] == 0)[0][0]
-            t5_end = np.where(t5_mask[i] == 0)[0][0]
-            all_clip_embs.append(clip_emb[i][:clip_end])
-            all_t5_embs.append(t5_emb[i][:t5_end])
-
+            clip_maskeds, t5_maskeds = np.where(clip_mask[i] == 0)[0], np.where(t5_mask[i] == 0)[0]
+            if len(clip_maskeds) == 0:
+                all_clip_embs.append(clip_emb[i])
+            else:
+                first_masked = clip_maskeds[0]
+                all_clip_embs.append(clip_emb[i][:first_masked])
+            if len(t5_maskeds) == 0:
+                all_t5_embs.append(t5_emb[i])
+            else:
+                first_masked = t5_maskeds[0]
+                all_t5_embs.append(t5_emb[i][:first_masked])
+            
         if len(all_latents) >= TFRECORD_MIN_EXAMPLES:
-            num_records = len(gfile.glob(os.path.join(args.write_dir, '*.tfrecord')))
-            example_path = os.path.join(args.write_dir, f"example{num_records}.tfrecord")
+            example_path = os.path.join(args.write_dir, f"example{num_records}_{jax.process_index()}.tfrecord")
 
             with tf.io.TFRecordWriter(example_path) as file_writer:
                 for i in range(len(all_latents)):
@@ -131,6 +142,7 @@ def main(_):
 
             printl(f"wrote tfrecord file to {example_path} on node {jax.process_index()}, all latents had len {len(all_latents)}")
             all_latents, all_clip_embs, all_t5_embs = [], [], []
+            num_records += 1
 
     
 

@@ -22,6 +22,7 @@ tf_set_visible_devices([], device_type="GPU")
 np.set_printoptions(precision=4)
 jnp.set_printoptions(precision=4)
 
+
 args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
 flags.DEFINE_string("prompt", "a cat watching TV, a blue shirt, a red cube on top of a blue cube, a green clock in a pentagon shape, an armchair in the shape of an avocado", "the prompt.")

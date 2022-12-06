@@ -39,15 +39,15 @@ def get_config():
             args=D(
                 ch=256,
                 emb_ch=1024,  # default is ch * 4
-                ch_mult=[1, 2, 3],
-                num_res_blocks=2,
-                attn_resolutions=[8, 16],
-                head_dim=64,
+                ch_mult=[2, 2, 3, 4],
+                num_res_blocks=3,
+                attn_resolutions=[32, 16, 8, 4],
+                head_dim=128,
                 dropout=0.0,
                 logsnr_input_type='inv_cos',
                 resblock_resample=True,
                 out_ch=4,
-                seq_width=256, #need not divide ch, but MUST divide both clip_dim and t5_dim
+                seq_width=1024,
                 param_dtype='bf16',
             ),
             mean_type='v', # eps, x, both, v
@@ -65,7 +65,7 @@ def get_config():
         ),
         train=D(
             # optimizer
-            batch_size=256,
+            batch_size=160,
             optimizer='adam',
             adam_beta2=0.995,
             learning_rate=8e-5,
@@ -83,8 +83,8 @@ def get_config():
             #eval_every_steps=10000,
             checkpoint_dirs=["{}/checkpoints_recent", "{}/checkpoints_permanent"],  
             num_checkpoints=[10, 999999],
-            save_freq=[10000, 100000],
-            iterations=800001
+            save_freq=[2500, 100000],
+            iterations=15000
 
         ),
     )
