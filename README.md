@@ -26,7 +26,7 @@ To-do's (not strictly in order)
 - [x] improve logging, metrics, and evaluation (probably wandb so that experiment runs can be shared online)
 - [x] make compatible with diffusers, specifically the samplers, and possibly incorporate their U-Net as well.
 - [ ] train latent diffusion model on imagenet 256 at f=8
-- [ ] implement gradient checkpointing and mixed-precision training, and any further memory reductions (especially with respect to optimizer state)
+- [x] implement gradient checkpointing and mixed-precision training, and any further memory reductions (especially with respect to optimizer state)
 - [ ] try everything karras-EDM related and test results
 - [ ] work on dataloader for LAION dataset, that might include pre-computed text and/or image embeddings
 - [ ] write training script for a text-to-image latent diffusion model
