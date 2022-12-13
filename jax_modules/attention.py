@@ -49,8 +49,8 @@ class SequenceProcessor(nn.Module):
             seq_width = self.seq_width
 
         assert hc%seq_width == 0 and ht5%seq_width == 0
-        clip_seq = nn.Dense(seq_width)(LN32()(clip_seq))
-        t5_seq = nn.Dense(seq_width)(LN32()(t5_seq))
+        clip_seq = nn.Dense(seq_width)(clip_seq)
+        t5_seq = nn.Dense(seq_width)(t5_seq * 4.0) #t5 sequence has less variance
         
         null_emb = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
         return jnp.concatenate([null_emb, clip_seq, t5_seq], axis=1)

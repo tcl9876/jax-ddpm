@@ -25,7 +25,6 @@ import functools
 from typing import Any, Union
 
 from diffusion.dpm import DiffusionWrapper
-from diffusion.schedules import get_logsnr_schedule
 from .unet import UNetTextConditioned
 from . import utils
 from .optimizer import make_adam, unshard_pytree
@@ -42,7 +41,6 @@ def replace_params(state, new_params):
 	state = state.replace(params=None)
 	return state.replace(
 		step=state.step + 1,
-		accum_step=0,
 		params=new_params
 	)
 
@@ -61,10 +59,9 @@ def replace_opt(state, new_opt_state):
 	state = state.replace(optimizer_state=None)
 	return state.replace(optimizer_state=new_opt_state)
 
-@jax.jit
-def zero_accum_grad(state):
-	return state.replace(accum_grad=utils.zero_pytree(state.accum_grad))
-
+#TPU's pad if ch<128, this becomes a problem if optimizer states have ch of 512 or 768
+#since its sharded version (that divides by 8) will result in 64 or 96 channels
+#to avoid padding, we move from the second last to last axis so its divisible by 128 
 def move_to_last_axis(pytree, mul=2):
 	def movefn(x):
 		xshape = x.shape
@@ -90,10 +87,8 @@ def move_from_last_axis(pytree, mul=2):
 @flax.struct.dataclass
 class TrainState:
 	step: int
-	accum_step: int
 	params: Any
 	sharded_params: Any #sharded FP32 copy of model parameters
-	accum_grad: Any #sharded aggregate gradient for accumulation
 	optimizer_state: Any
 	ema_params: Any
 
@@ -131,14 +126,6 @@ class Trainer:
 
 		self._eval_step = None
 
-		# infer number of output channels for UNet
-		x_ch = self.dataset.data_shape[-1]
-		out_ch = x_ch
-		if config.model.mean_type == 'both':
-			out_ch += x_ch
-		if 'learned' in config.model.logvar_type:
-			out_ch += x_ch
-
 		self.model = UNetTextConditioned(**config.model.args)
 		self.devices = jax.local_devices()
 
@@ -150,7 +137,7 @@ class Trainer:
 		init_kwargs = dict(
 			x=jnp.zeros((1, *self.dataset.data_shape), dtype=jnp.float32),
 			context={"clip_emb": jnp.zeros((1, 77, 1024), dtype=jnp.float32), "t5_emb": jnp.zeros((1, 77, 1024), dtype=jnp.float32)},
-			logsnr=jnp.zeros((1,), dtype=jnp.float32),
+			alpha=jnp.ones((1,), dtype=jnp.float32)*0.5,
 			train=False,
 		)
 		return self.model.init({'params': global_rng}, **init_kwargs)['params']
@@ -167,7 +154,6 @@ class Trainer:
 		param_shards = []
 		ema_param_shards = []
 		opt_shards = []
-		accum_grad_shards = []
 		self.tx = make_adam(self.config)
 
 		for i in range(self.device_count):
@@ -183,12 +169,6 @@ class Trainer:
 			ema_param_shards.append(utils.copy_pytree(param_shards[i]))
 		sharded_ema_params = jax.device_put_sharded(ema_param_shards, self.devices)
 		del ema_param_shards
-		
-		for i in range(self.device_count):
-			print('accum g', i)
-			accum_grad_shards.append(utils.zero_pytree(param_shards[i]))
-		sharded_accum_grads = jax.device_put_sharded(accum_grad_shards, self.devices)
-		del accum_grad_shards
 
 		for i in range(self.device_count):
 			print('o', i, 'len arr', len(param_shards))
@@ -200,10 +180,8 @@ class Trainer:
 		#self.update = self.make_update_fn()
 		return TrainState(
 			step=replicate(0),
-			accum_step=replicate(0),
 			params=init_params,
 			sharded_params=sharded_params,
-			accum_grad=sharded_accum_grads,
 			optimizer_state=sharded_optimizer_states,
 			ema_params=sharded_ema_params
 		)
@@ -226,100 +204,77 @@ class Trainer:
 			label = label*(1-mask) + mask*uncond_label
 			context[key] = label
 
-		def model_fn(x, logsnr):
+		def model_fn(x, alpha):
 			
 			return self.model.apply(
-				{'params': params}, x=x, logsnr=logsnr, context=context, train=train,
+				{'params': params}, x=x, alpha=alpha, context=context, train=train,
 				rngs={'dropout': next(rng)} if train else None)
 
-		target_model_fn = None
 
 		logging.info(
-			f'train_logsnr_schedule: {self.config.model.train_logsnr_schedule}')
+			f'train_alpha_schedule: {self.config.model.train_alpha_schedule}')
 		model = DiffusionWrapper(
 			model_fn=model_fn,
-			target_model_fn=target_model_fn,
 			mean_type=self.config.model.mean_type,
 			logvar_type=self.config.model.logvar_type,
-			logvar_coeff=self.config.model.get('logvar_coeff', 0.))
-		loss_dict = model.training_losses(
+			logvar_coeff=self.config.model.get('logvar_coeff', 0.),
+			alpha_schedule=self.config.model.train_alpha_schedule,
+			tmin=self.config.model.tmin)
+		
+		loss = model.training_losses(
 			x=img,
 			rng=next(rng),
-			logsnr_schedule_fn=get_logsnr_schedule(
-				**self.config.model.train_logsnr_schedule),
 			num_steps=self.current_num_steps,
 			mean_loss_weight_type=self.config.model.mean_loss_weight_type)
 
-		assert all(v.shape == (img.shape[0],) for v in loss_dict.values())
-		loss_dict = {k: v.mean() for (k, v) in loss_dict.items()}
-		return loss_dict['loss'], loss_dict
+		return loss
 
-	def forward_backward(self, rng, batch, state, process_id):
+	def forward_backward(self, rng, batch, state, local_core_on_chip, loss_metric, gnorm_metric):
 		rng = utils.RngGen(rng)
 
 		# Loss and gradient
 		loss_fn = functools.partial(self.loss_fn, next(rng), True, batch)
-
-		# Training mode
-		(_, metrics), grad = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+		loss, grad = jax.value_and_grad(loss_fn)(state.params)
 
 		# Average grad across shards after casting to fp32.
 		grad = utils.to_fp32(grad)
-		grad, metrics['gnorm'] = utils.clip_by_global_norm(
+		grad, gnorm = utils.clip_by_global_norm(
 			grad, clip_norm=self.config.train.grad_clip)
 		grad = jax.lax.pmean(grad, axis_name='batch')
 
-		# Average metrics across shards
-		metrics = utils.to_fp32(metrics)
-		metrics = jax.lax.pmean(metrics, axis_name='batch')
-		assert all(v.shape == () for v in metrics.values())
-		metrics = {  # prepend prefix to names of metrics
-			f"train/{k}": v for k, v in metrics.items()
-		}
+
+		avg_loss = jax.lax.pmean(loss, axis_name='batch')
+		avg_gnorm = jax.lax.pmean(gnorm, axis_name='batch')
+		loss_metric += avg_loss
+		gnorm_metric += avg_gnorm
 		        
-		grad = jax.tree_map(lambda g: reshape_and_transpose(g)[process_id], grad)
+		#TODO: grad skipping?
+		grad = jax.tree_map(lambda g: reshape_and_transpose(g)[local_core_on_chip], grad)
 		grad = move_to_last_axis(grad)
+		return grad, loss_metric, gnorm_metric
 
-		new_accum_grad = jax.tree_map(
-			lambda x, y: x+y,
-			state.accum_grad, grad
+	def update_fn(self, state, grad):
+		#apply adam update on sharded FP32 state, then downcast and unshard the fp32 model params.
+		updates, new_opt_state = self.tx.update(
+			grad, state.optimizer_state, state.sharded_params
 		)
-		#update accumulated gradient if&onlyif gradient is all finite (no inf/Nan)
-		'''all_finite = jnp.all(
-			jnp.array([jnp.all(jnp.isfinite(p)) for p in jax.tree_util.tree_flatten(new_accum_grad)[0]])
+		new_sharded_params = optax.apply_updates(state.sharded_params, updates)
+
+		new_ema_params = utils.apply_ema(self.config.train.ema_decay, 
+				avg=state.ema_params, new=new_sharded_params)
+		
+		casted_new_params = jax.tree_util.tree_map(
+			lambda x, y: x.astype(y.dtype),
+			new_sharded_params, state.params
 		)
-		truefn = lambda state: state.replace(accum_grad=new_accum_grad, accum_step=state.accum_step+1)
-		falsefn = lambda state: state
-		state = jax.lax.cond(all_finite, truefn, falsefn, state)'''
-		state = state.replace(accum_grad=new_accum_grad, accum_step=state.accum_step+1)
-		return state, metrics
-	
-	def update_fn(self, state):
-			n_accums = self.config.train.n_accums
+		casted_new_params = move_from_last_axis(casted_new_params)
+		new_params = unshard_pytree(casted_new_params)
 
-			#def update(state):
-			#apply adam update on sharded FP32 state, then downcast and unshard the fp32 model params.
-			updates, new_opt_state = self.tx.update(
-				state.accum_grad, state.optimizer_state, state.sharded_params
-			)
-			new_sharded_params = optax.apply_updates(state.sharded_params, updates)
-
-			new_ema_params = utils.apply_ema(self.config.train.ema_decay, 
-					avg=state.ema_params, new=new_sharded_params)
-			
-			casted_new_params = jax.tree_util.tree_map(
-				lambda x, y: x.astype(y.dtype),
-				new_sharded_params, state.params
-			)
-			casted_new_params = move_from_last_axis(casted_new_params)
-			new_params = unshard_pytree(casted_new_params)
-
-			state = replace_params(state, new_params)
-			state = replace_sharded_params(state, new_sharded_params)
-			state = replace_ema_params(state, new_ema_params)
-			state = replace_opt(state, new_opt_state)
-			state = zero_accum_grad(state)
-			return state
+		state = replace_params(state, new_params)
+		state = replace_sharded_params(state, new_sharded_params)
+		state = replace_ema_params(state, new_ema_params)
+		state = replace_opt(state, new_opt_state)
+		return state
 		
 
 class MeanObject(object):

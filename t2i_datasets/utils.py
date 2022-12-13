@@ -6,7 +6,7 @@ import os
 
 def read_encoded(example):
     features = {
-        "latents": tf.io.FixedLenFeature([], tf.string),
+        "image": tf.io.FixedLenFeature([], tf.string),
         "clip_emb": tf.io.FixedLenFeature([], tf.string),
         "t5_emb": tf.io.FixedLenFeature([], tf.string),
     }
@@ -16,8 +16,8 @@ def read_encoded(example):
         example[key] = tf.io.parse_tensor(example[key], tf.bfloat16)
         example[key] = tf.cast(example[key], tf.float32)
     
-    example["image"] = tf.transpose(example["latents"], [2, 0, 1]) #TODO: see about removing the transpose by fixing dataset encoder builder.
-    del example["latents"]
+    #example["image"] = tf.transpose(example["image"], [2, 0, 1]) #TODO: see about removing the transpose by fixing dataset encoder builder.
+    #del example["images"]
     
     for key in ["clip_emb", "t5_emb"]:
         example[key] = tf.concat([example[key], tf.zeros([77, 1024], dtype=tf.float32)], axis=0)[:77] #zero pad to 77
@@ -40,8 +40,12 @@ def read_pixels(example):
 def make_encoders_fn(vae, clip_text_module, t5_module):
     
     def encoders_fn(processed_images, clip_inputs, t5_inputs, vae_params, clip_text_params, t5_params):
-        latents = vae.apply({"params": vae_params}, processed_images, method=vae.encode)
-        normalized_sample = latents.latent_dist.mean * 0.18215
+        
+        if vae_params is not None:
+            latents = vae.apply({"params": vae_params}, processed_images, method=vae.encode)
+            normalized_sample = latents.latent_dist.mean * 0.18215
+        else:
+            normalized_sample = None
 
         input_ids = clip_inputs["input_ids"]
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
@@ -63,9 +67,23 @@ def all_tfrecords(data_dir):
                 tfrecords_list.append(fname)
     return tfrecords_list
 
-def build_tfrecord_dataset(tfrecord_dir, batch_sizes, map_fn, process_index, process_count, repeating):
-    filenames = all_tfrecords(tfrecord_dir)
-    dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=tf.data.AUTOTUNE).map(map_fn, num_parallel_calls=tf.data.AUTOTUNE)
+def build_tfrecord_dataset(data_dirs, batch_sizes, map_fn, process_index, process_count, repeating, sampling_probs=None):
+    dirs = [s.strip() for s in data_dirs.split(",")]
+    if len(dirs) > 1:
+        datasets = []
+        for tfrecord_dir in dirs:
+            filenames = all_tfrecords(tfrecord_dir)
+            datasets.append(
+                tf.data.TFRecordDataset(filenames, num_parallel_reads=tf.data.AUTOTUNE)
+            )
+        weights = [float(p) for p in sampling_probs.split(",")]
+        dataset = tf.data.Dataset.sample_from_datasets(
+            datasets, weights=weights)
+    else:
+        filenames = all_tfrecords(dirs[0])
+        dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=tf.data.AUTOTUNE)
+
+    dataset = dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.shard(index=process_index, num_shards=process_count)
     if repeating:
         dataset = dataset.repeat()

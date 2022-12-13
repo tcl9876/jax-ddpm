@@ -30,165 +30,117 @@ import numpy as onp
 
 ### Basic diffusion process utilities
 
+# NOTE: the variable "alpha" is the same as alpha_bar in the original DDPM paper
+# this is different from the diffusion-distillation repo, which uses "alpha" to refer to sqrt(alpha_bar)
 
-def diffusion_forward(*, x, logsnr):
-	"""q(z_t | x)."""
+
+def get_alpha_set(name, beta_start, beta_end, steps, b1=None):
+	if name=='linear':
+		beta_schedule = onp.linspace(beta_start, beta_end, steps)		
+		alpha_schedule = onp.cumprod(1 - beta_schedule)
+		return jnp.array(alpha_schedule.astype('float32'))
+	else:
+		assert 0, "only linear support right now"
+
+
+def diffusion_forward(*, x, alpha):
 	return {
-			'mean': x * jnp.sqrt(nn.sigmoid(logsnr)),
-			'std': jnp.sqrt(nn.sigmoid(-logsnr)),
-			'var': nn.sigmoid(-logsnr),
-			'logvar': nn.log_sigmoid(-logsnr)
+		'mean': x * jnp.sqrt(alpha),
+		'std': jnp.sqrt(1 - alpha),
+		'var': (1 - alpha),
+		'logvar': jnp.log(1 - alpha)
 	}
 
-
-def predict_x_from_eps(*, z, eps, logsnr):
-	"""x = (z - sigma*eps)/alpha."""
-	logsnr = utils.broadcast_from_left(logsnr, z.shape)
-	return jnp.sqrt(1. + jnp.exp(-logsnr)) * (
-			z - eps * jax.lax.rsqrt(1. + jnp.exp(logsnr)))
-
-
-def predict_xlogvar_from_epslogvar(*, eps_logvar, logsnr):
-	"""Scale Var[eps] by (1+exp(-logsnr)) / (1+exp(logsnr)) = exp(-logsnr)."""
-	return eps_logvar - logsnr
+def predict_x_from_eps(*, xt, eps, alpha):
+	"""x = (xt - sqrt(1-alpha)*eps) / sqrt(alpha)."""
+	alpha = utils.broadcast_from_left(alpha, xt.shape)
+	sigma = jnp.sqrt(1 - alpha)
+	return (xt - sigma * eps) / jnp.sqrt(alpha)
 
 
-def predict_eps_from_x(*, z, x, logsnr):
-	"""eps = (z - alpha*x)/sigma."""
-	logsnr = utils.broadcast_from_left(logsnr, z.shape)
-	return jnp.sqrt(1. + jnp.exp(logsnr)) * (
-			z - x * jax.lax.rsqrt(1. + jnp.exp(-logsnr)))
+def predict_eps_from_x(*, xt, x, alpha):
+	"""x = (xt - sqrt(1-alpha)*eps) / sqrt(alpha)."""
+	"""eps = (xt - sqrt(alpha)*x) / sqrt(1-alpha)"""
+	alpha = utils.broadcast_from_left(alpha, xt.shape)
+	sigma = jnp.sqrt(1 - alpha)
+	return (xt - jnp.sqrt(alpha) * x) / sigma
 
-
-def predict_epslogvar_from_xlogvar(*, x_logvar, logsnr):
-	"""Scale Var[x] by (1+exp(logsnr)) / (1+exp(-logsnr)) = exp(logsnr)."""
-	return x_logvar + logsnr
-
-
-def predict_x_from_v(*, z, v, logsnr):
-	logsnr = utils.broadcast_from_left(logsnr, z.shape)
-	alpha_t = jnp.sqrt(jax.nn.sigmoid(logsnr))
-	sigma_t = jnp.sqrt(jax.nn.sigmoid(-logsnr))
-	return alpha_t * z - sigma_t * v
-
-
-def predict_v_from_x_and_eps(*, x, eps, logsnr):
-	logsnr = utils.broadcast_from_left(logsnr, x.shape)
-	alpha_t = jnp.sqrt(jax.nn.sigmoid(logsnr))
-	sigma_t = jnp.sqrt(jax.nn.sigmoid(-logsnr))
-	return alpha_t * eps - sigma_t * x
+def predict_x_from_v(*, xt, v, alpha):
+	alpha = utils.broadcast_from_left(alpha, xt.shape)
+	sigma = jnp.sqrt(1 - alpha)
+	return jnp.sqrt(alpha) * xt - sigma * v
 
 
 class DiffusionWrapper:
 
-	def __init__(self, model_fn, *, mean_type, logvar_type, logvar_coeff,
-							 target_model_fn=None, loss_scale=1.0):
+	def __init__(self, model_fn, *, mean_type, logvar_type, logvar_coeff, alpha_schedule, tmin):
 		self.model_fn = model_fn
 		self.mean_type = mean_type
 		self.logvar_type = logvar_type
 		self.logvar_coeff = logvar_coeff
-		self.target_model_fn = target_model_fn
-		self.loss_scale = loss_scale
+		self.alpha_set = get_alpha_set(**alpha_schedule)
+		self.tmin = tmin
 
-	def _run_model(self, *, z, logsnr, model_fn, clip_x):
-		model_output = model_fn(z, logsnr)
+	def _run_model(self, *, xt, alpha, model_fn):
+		model_output = model_fn(xt, alpha)
 		if self.mean_type == 'eps':
 			model_eps = model_output
 		elif self.mean_type == 'x':
 			model_x = model_output
 		elif self.mean_type == 'v':
 			model_v = model_output
-		elif self.mean_type == 'both':
-			_model_x, _model_eps = jnp.split(model_output, 2, axis=-1)  # pylint: disable=invalid-name
 		else:
 			raise NotImplementedError(self.mean_type)
 
 		# get prediction of x at t=0
-		if self.mean_type == 'both':
-			# reconcile the two predictions
-			model_x_eps = predict_x_from_eps(z=z, eps=_model_eps, logsnr=logsnr)
-			wx = utils.broadcast_from_left(nn.sigmoid(-logsnr), z.shape)
-			model_x = wx * _model_x + (1. - wx) * model_x_eps
-		elif self.mean_type == 'eps':
-			model_x = predict_x_from_eps(z=z, eps=model_eps, logsnr=logsnr)
+		if self.mean_type == 'eps':
+			model_x = predict_x_from_eps(xt=xt, eps=model_eps, alpha=alpha)
 		elif self.mean_type == 'v':
-			model_x = predict_x_from_v(z=z, v=model_v, logsnr=logsnr)
+			model_x = predict_x_from_v(xt=xt, v=model_v, alpha=alpha)
+		return model_x
 
-		# clipping
-		if clip_x:
-			model_x = jnp.clip(model_x, -1., 1.)
 
-		# get eps prediction if clipping or if mean_type != eps
-		if self.mean_type != 'eps' or clip_x:
-			model_eps = predict_eps_from_x(z=z, x=model_x, logsnr=logsnr)
-
-		# get v prediction if clipping or if mean_type != v
-		if self.mean_type != 'v' or clip_x:
-			model_v = predict_v_from_x_and_eps(
-					x=model_x, eps=model_eps, logsnr=logsnr)
-
-		return {'model_x': model_x,
-						'model_eps': model_eps,
-						'model_v': model_v}
-
-	def training_losses(self, *, x, rng, logsnr_schedule_fn,
-											num_steps, mean_loss_weight_type):
-		assert x.dtype in [jnp.float32, jnp.float64]
+	def training_losses(self, *, x, rng, num_steps, mean_loss_weight_type):
+		assert x.dtype == jnp.float32
 		assert isinstance(num_steps, int)
 		rng = utils.RngGen(rng)
 		eps = jax.random.normal(next(rng), shape=x.shape, dtype=x.dtype)
 		bc = lambda z: utils.broadcast_from_left(z, x.shape)
 
-		# sample logsnr
-		if num_steps > 0:
-			logging.info('Discrete time training: num_steps=%d', num_steps)
-			assert num_steps >= 1
-			t = jax.random.randint(
-					next(rng), shape=(x.shape[0],), minval=0, maxval=num_steps)
-			u = (t+1).astype(x.dtype) / num_steps
-		else:
-			logging.info('Continuous time training')
-			# continuous time
-			u = jax.random.uniform(next(rng), shape=(x.shape[0],), dtype=x.dtype)
-		logsnr = logsnr_schedule_fn(u)
-		assert logsnr.shape == (x.shape[0],)
 
-		# sample z ~ q(z_logsnr | x)
-		z_dist = diffusion_forward(x=x, logsnr=bc(logsnr))
-		z = z_dist['mean'] + z_dist['std'] * eps
+		t = jax.random.randint(
+				next(rng), shape=(x.shape[0],), minval=self.tmin, maxval=num_steps)
+		#alpha = self.alpha_set[t]
+		alpha = jnp.take(self.alpha_set, t)
+		print('gather shapes', alpha.shape, t.shape, bc(alpha).shape)
 
+		xt_dist = diffusion_forward(x=x, alpha=bc(alpha))
+		xt = xt_dist['mean'] + xt_dist['std'] * eps
+
+		#broadcast here?
 		x_target = x
-		eps_target = eps
-		v_target = predict_v_from_x_and_eps(
-				x=x_target, eps=eps_target, logsnr=logsnr)
-
-		# denoising loss
 		model_output = self._run_model(
-				z=z, logsnr=logsnr, model_fn=self.model_fn, clip_x=False)
+				xt=xt, alpha=alpha, model_fn=self.model_fn)
+		x_mse = utils.meanflat(jnp.square(model_output - x_target))
+		snr = alpha / (1 - alpha)
 
-		x_mse = utils.meanflat(jnp.square(model_output['model_x'] - x_target))
-		eps_mse = utils.meanflat(jnp.square(model_output['model_eps'] - eps_target))
-		v_mse = utils.meanflat(jnp.square(model_output['model_v'] - v_target))
-		
 		if mean_loss_weight_type == 'p2':
-			#p2 weighting with gamma = 1
-			assert logsnr.shape == eps_mse.shape
-			reweighting_factor = 1 / (1 + jnp.exp(logsnr))
-			loss = eps_mse * reweighting_factor
+			reweighting_factor = snr * (1 - alpha)
 		elif mean_loss_weight_type == 'p2_half':
-			#p2 with gamma = 0.5. This might be better as its in the latent space where imperceptible information has been removed already.
-			reweighting_factor = 1 / jnp.sqrt(1 + jnp.exp(logsnr))
-			loss = eps_mse * reweighting_factor
-		elif mean_loss_weight_type == 'constant':  # constant weight on x_mse
-			loss = x_mse
-		elif mean_loss_weight_type == 'snr':  # SNR * x_mse = eps_mse
-			loss = eps_mse
-		elif mean_loss_weight_type == 'snr_trunc':  # x_mse * max(SNR, 1)
-			loss = jnp.maximum(x_mse, eps_mse)
+			reweighting_factor = snr * jnp.sqrt(1 - alpha)
+		elif mean_loss_weight_type == 'constant':  
+			reweighting_factor = 1.
+		elif mean_loss_weight_type == 'snr': 
+			reweighting_factor = snr
+		elif mean_loss_weight_type == 'snr_trunc':  
+			reweighting_factor = jnp.maximum(snr, 1.)
 		elif mean_loss_weight_type == 'v_mse':
-			loss = v_mse
+			reweighting_factor = snr + 1.
+		elif mean_loss_weight_type == 'root_snr':
+			reweighting_factor = jnp.sqrt(snr)
 		else:
 			raise NotImplementedError(mean_loss_weight_type)
 		
-		loss = loss * self.loss_scale
-		return {'loss': loss}
+		loss = x_mse * reweighting_factor
+		loss = jnp.mean(loss)
+		return loss

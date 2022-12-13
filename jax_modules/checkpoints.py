@@ -178,7 +178,7 @@ def state_make_unreplicated(state):
 	cpu_state = jax.device_get(state)
 	return cpu_state.replace(
 		step = unreplicate(cpu_state.step),
-		accum_step = unreplicate(cpu_state.accum_step),
+		#accum_step = unreplicate(cpu_state.accum_step),
 		params = unreplicate(cpu_state.params),
 	)
 	"""
@@ -192,6 +192,6 @@ def state_make_unreplicated(state):
 def state_make_replicated(state):
 	return state.replace(
 		step = replicate(state.step),
-		accum_step = replicate(state.accum_step),
+		#accum_step = replicate(state.accum_step),
 		params = replicate(state.params),
 	)

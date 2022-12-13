@@ -16,6 +16,7 @@ args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
 flags.DEFINE_string("global_dir", None, "the global directory you will save all training stuff into.")
 flags.DEFINE_string("data_dir", None, "the directory where your data is stored (or where it will be downloaded into).")
+flags.DEFINE_string("sampling_probs", None, "if data_dir is a comma separated list of image directories, the respective probabilities to sample from each (also as comma separated list)")
 flags.DEFINE_string("wandb_project", None, "if you are using wandb to manage experiments, the project name.")
 flags.DEFINE_string("wandb_run", None, "if you are using wandb to manage experiments, the experiment run name.")
 flags.mark_flags_as_required(["config", "global_dir"])
@@ -74,14 +75,13 @@ def main(_):
         print("MODEL CONFIG:", config.model)
         print("TRAINING CONFIG:", targs)
 
-    dataset_info_obj = Namespace(data_shape=[32, 32, 4]) #we manually build tfrecord, can maybe clear up the legacy dataset code later.
+    dataset_info_obj = Namespace(data_shape=config.in_dimensions) #we manually build tfrecord, can maybe clear up the legacy dataset code later.
     trainer = Trainer(config, dataset=dataset_info_obj)
     state = trainer.make_init_state()
     state = restore_checkpoint(targs.checkpoint_dirs[0], state, make_replicated=True)
     
-    devices = jax.devices()
-    #start_step = int(unreplicate(state.step))
-    start_step = 0
+    devices = jax.local_devices()
+    start_step = int(unreplicate(state.step))
     barrier()
 
     print(f"Current iteration after restore on node {jax.process_index()}: {start_step}")
@@ -93,64 +93,57 @@ def main(_):
     update_func = jax.pmap(trainer.update_fn, axis_name='i')
 
     train_iter = build_tfrecord_dataset(args.data_dir, batch_sizes=[targs.batch_size//jax.local_device_count(), jax.local_device_count()],
-        map_fn=read_encoded, process_index=jax.process_index(), process_count=jax.process_count())
+        map_fn=read_encoded, process_index=jax.process_index(), process_count=jax.process_count(), repeating=True, sampling_probs=args.sampling_probs)
 
     s = time.time()
-    metrics = Metrics(["train/gnorm", "train/loss"])
-
     if ismain:
         print("batch shapes:")
         jax.tree_map(lambda x: print(x.shape), next(train_iter))
+    
+    devices = jax.devices()
+    local_devices = jax.local_devices()
+    local_device_count = jax.local_device_count()
 
-    process_ids = jax.device_put_sharded([jax.numpy.int32(i) for i in range(8)], jax.local_devices())  
+    local_core_on_chip = jax.device_put_sharded([jax.numpy.int32(i) for i in range(8)], local_devices)  
     global_rng = jax.random.PRNGKey(jax.process_index()) #set seed to process index so different nodes dont receive same rngs
+    loss_metric = jax.device_put_replicated(jax.numpy.float32(0.), local_devices)
+    gnorm_metric = jax.device_put_replicated(jax.numpy.float32(0.), local_devices)
+
     for global_step in range(start_step, targs.iterations + 1):
         batch = next(train_iter)
-        global_rng, *train_step_rng = jax.random.split(global_rng, num=jax.local_device_count() + 1)
+        global_rng, *train_step_rng = jax.random.split(global_rng, num=local_device_count + 1)
         train_step_rng = jax.device_put_sharded(train_step_rng, devices)
 
-		#first run forward and backwards pass, and all-reduce the grads across ALL nodes. 
-		#then self.optimizer.update takes the grads and applies them seperately per node. then we wait for all nodes to finish via a barrier.
-        state, new_metrics = fb_step(train_step_rng, batch, state, process_ids) 
-
-        if global_step == start_step:
-            #flatgrad = jax.tree_util.tree_flatten(grad)[0]
-            flatparams = jax.tree_util.tree_flatten(state.params)[0]
-            flatmu = jax.tree_util.tree_flatten(state.optimizer_state[0].mu)[0]
-            flatnu = jax.tree_util.tree_flatten(state.optimizer_state[0].nu)[0]
-            for p, m, n in zip(flatparams, flatmu, flatnu):
-                print(p.dtype, m.shape, n.shape)
-            print('Trying with everything, with optimizer and whatnot')
+        grad, loss_metric, gnorm_metric = fb_step(train_step_rng, batch, state, local_core_on_chip, loss_metric, gnorm_metric)         
+        state = update_func(state, grad)   
         
-        if (global_step+1)%config.train.n_accums == 0:
-            state = update_func(state)
-            # barrier() #TODO: experiment both with and without barrier on v3-32, benchmark speeds for each. 
-            # also does it recompile? even just a regular psum if recompiled would be slow. could also be device_get() thats slow - check this too, prob better not use device_get
+        # barrier() #TODO: experiment both with and without barrier on v3-32, benchmark speeds for each. 
+        #why does it work for 2 steps but not 3? this happens with multiple models
 
         if global_step < 10: print('A step was successfully completed')
 
-        if global_step%100==0:
-            new_metrics = unreplicate(new_metrics)
-            new_metrics = jax.tree_map(lambda x: float(x.mean()), new_metrics)
-            metrics.update(new_metrics)
-
-        if global_step % targs.log_loss_every_steps==0: 
-            real_step = unreplicate(state.step)
+        if global_step%targs.log_loss_every_steps==0:
+            loss_unrep = unreplicate(loss_metric) / targs.log_loss_every_steps
+            gnorm_unrep = unreplicate(gnorm_metric) / targs.log_loss_every_steps
             kwargs = {
-                "real step": real_step,
-                "total images seen": real_step * targs.batch_size,
-                "metrics": metrics,
-                "seconds elapsed": round(time.time()-s)
+                "step": global_step + start_step,
+                "metrics": {
+                    "loss": loss_unrep,
+                    "gnorm": gnorm_unrep,
+                },
+                "time": round(time.time()-s) 
             }
+
             if ismain:
                 print_and_log_dict(logfile_path, kwargs, use_wandb)
-            metrics.reset_states()
+            loss_metric *= 0
+            gnorm_metric *= 0
         
         for checkpoint_dir, num_checkpoints, save_freq in zip(targs.checkpoint_dirs, targs.num_checkpoints, targs.save_freq):
             if global_step%save_freq==0 and ismain:
                 state_unrep = state_make_unreplicated(state)
                 save_checkpoint(checkpoint_dir, state_unrep, keep=num_checkpoints, step=state_unrep.step)
-        
+                
 #checkpoints saving has a very large alloc? fix this?
 #INIT STEP IS ALWAYS ZERO: FIX THIS
 

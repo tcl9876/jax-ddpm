@@ -33,14 +33,15 @@ def get_config():
             ),
         ),
         sampler='ddim',
+        in_dimensions=[32,32,4],
         model=D(
             # architecture
             name='unet_iddpm',
             args=D(
                 ch=256,
-                emb_ch=1024,  # default is ch * 4
+                emb_ch=512,  # default is ch * 4
                 ch_mult=[1, 1, 2, 2],
-                num_res_blocks=1,
+                num_res_blocks=2,
                 attn_resolutions=[16, 8, 4],
                 head_dim=128,
                 dropout=0.0,
@@ -59,6 +60,9 @@ def get_config():
             train_alpha_schedule=D(name='linear', beta_start=0.00085, beta_end=0.012, steps=1000),
             eval_alpha_schedule=D(name='linear', beta_start=0.00085, beta_end=0.012, steps=1000),
             tmin=5,
+            eval_clip_denoised=False,
+            t5_model_id="t5-3b",
+            clip_model_id="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
             vae_id="CompVis/stable-diffusion-v1-4"
         ),
         train=D(
@@ -80,7 +84,7 @@ def get_config():
             checkpoint_dirs=["{}/checkpoints_recent", "{}/checkpoints_permanent"],  
             num_checkpoints=[10, 999999],
             save_freq=[10000, 100000],
-            iterations=100001
+            iterations=1000001
 
         ),
     )

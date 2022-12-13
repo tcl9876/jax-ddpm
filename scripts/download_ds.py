@@ -3,18 +3,27 @@ from img2dataset import download
 import jax
 from tensorflow.io import gfile
 import argparse
-
+import time
 
 # NOTE: running this downloader in multinode fashion only works within a TPU node, and is only meant to be used as such. 
 # can maybe add explicit flags for process_index and process_count later
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='download metadata')
+
     parser.add_argument('--data_dir', type=str, help='metadata location')
     parser.add_argument('--write_dir', type=str, help='output location')
+    parser.add_argument('--caption_col', type=str, help='caption col. should be "top_caption" for laion coco.')
+    parser.add_argument('--image_size', type=int, help='img size')
+    parser.add_argument('--min_image_size', type=int, default=0, help='min img size')
     parser.add_argument('--processes_count', type=int, help='processes count', default=16)
     parser.add_argument('--thread_count', type=int, help='thread count', default=256)
     parser.add_argument('--input_format', type=str, help='input format', default='parquet')
+    parser.add_argument('--resize_mode', type=str, help='resize mode', default='center_crop')
+    parser.add_argument('--max_aspect_ratio', type=str, help='max aspect ratio', default='2.5')
+
     args = parser.parse_args()
+    print(args)
+    time.sleep(5)
 
     process_index, process_count = jax.process_index(), jax.process_count()
     data_files = sorted(gfile.glob(os.path.join(args.data_dir, f'*.{args.input_format}')))
@@ -38,17 +47,19 @@ if __name__ == '__main__':
                 processes_count=args.processes_count,
                 thread_count=args.thread_count,
                 url_list=data_path,
-                image_size=256,
+                image_size=args.image_size,
                 output_folder=os.path.join(args.write_dir, f"tfr_{i}"),
                 output_format="tfrecord",
                 input_format=args.input_format,
                 url_col="URL",
-                caption_col="TEXT",
+                caption_col=args.caption_col,
                 enable_wandb=False,
-                min_image_size=256,
+                min_image_size=args.min_image_size,
                 number_sample_per_shard=10000,
                 distributor="multiprocessing",
                 disallowed_header_directives=["noai", "noindex"],
+                resize_mode=args.resize_mode,
+                max_aspect_ratio=float(args.max_aspect_ratio)
             )
         except BaseException as e:
             print(e)
@@ -65,4 +76,13 @@ git lfs install
 git clone https://huggingface.co/datasets/ChristophSchuhmann/improved_aesthetics_6plus
 gsutil -m mv improved_aesthetics_6plus gs://MY_BUCKET/
 
+
+laion coco download
+
+for i in range(128):
+    i = str(i).zfill(3)
+    os.system(f"wget https://huggingface.co/datasets/laion/laion-coco/resolve/main/part-00{i}-2256f782-126f-4dc6-b9c6-e6757637749d-c000.snappy.parquet")
+    os.system(f"gsutil -m cp part-00{i}-2256f782-126f-4dc6-b9c6-e6757637749d-c000.snappy.parquet gs://jax-ddpm-eu/laion-coco-records/")
+    os.system(f"rm -rf part-00{i}-2256f782-126f-4dc6-b9c6-e6757637749d-c000.snappy.parquet")
+    
 """

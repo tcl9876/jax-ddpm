@@ -26,7 +26,7 @@ from flax.training.common_utils import shard
 from PIL import Image
 from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
 
-from diffusion.dpm import DiffusionWrapper
+from diffusion.dpm import DiffusionWrapper, get_alpha_set, predict_eps_from_x
 from diffusion.schedules import get_logsnr_schedule
 from diffusers.models.vae_flax import FlaxAutoencoderKL
 from diffusers.schedulers import FlaxDDIMScheduler, FlaxLMSDiscreteScheduler, FlaxPNDMScheduler
@@ -161,6 +161,7 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
         latents: Optional[jnp.array] = None,
         debug: bool = False,
     ):
+
         batch_size = len(context["clip_emb"]) #prompt_ids.shape[0]
         if self.vae is not None:
             if height % 8 != 0 or width % 8 != 0:
@@ -178,19 +179,20 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
             if latents.shape != latents_shape:
                 raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}")
 
-        model_fn = lambda x, logsnr: self.unet.apply(
-			{'params': params["unet"]}, x=x, logsnr=logsnr, context=context, train=False) #TODO: allow for label and text input.
+        model_fn = lambda x, alpha: self.unet.apply(
+			{'params': params["unet"]}, x=x, alpha=alpha, context=context, train=False) #TODO: allow for label and text input.
         
         margs = self.model_config
         model_wrap = DiffusionWrapper(
 			model_fn=model_fn,
 			mean_type=margs.mean_type,
 			logvar_type=margs.logvar_type,
-			logvar_coeff=margs.get('logvar_coeff', 0.)
+			logvar_coeff=margs.get('logvar_coeff', 0.),
+			alpha_schedule=margs.eval_alpha_schedule,
+            tmin=margs.tmin
         )
-        logsnr_schedule_fn=get_logsnr_schedule(
-				**margs.eval_logsnr_schedule)
-        print(margs.eval_logsnr_schedule)
+        print(margs.eval_alpha_schedule)
+        print(model_wrap.alpha_set[::50])
         
         latents = jnp.transpose(latents, [0, 2, 3, 1]) #prog-dist unet takes in NHWC, may change if we switch to diffusers Unet
         def loop_body(step, args):
@@ -202,15 +204,18 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
 
             t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
             timestep = jnp.broadcast_to(t, latents_input.shape[0]).astype(latents_input.dtype)
-            latents_input = self.scheduler.scale_model_input(scheduler_state, latents_input, t)
-            logsnr_t = logsnr_schedule_fn((timestep + 1) / (scheduler_state.timesteps.max() + 1))
+            if hasattr(self.scheduler, "init_noise_sigma"): latents_input = self.scheduler.scale_model_input(scheduler_state, latents_input, t)
+            alpha = jnp.take(model_wrap.alpha_set, timestep.astype(jnp.int32))
 
-            noise_pred = model_wrap._run_model(
-                z=jnp.array(latents_input),
-                logsnr=logsnr_t, #jnp.full((latents.shape[0],), logsnr_t),
-                model_fn=model_fn,
-                clip_x=margs.eval_clip_denoised
-            )["model_eps"]
+            print(latents_input.shape, alpha.shape, context['clip_emb'].shape, context['t5_emb'].shape)
+            print(alpha, t, timestep)
+
+            model_pred = model_wrap._run_model(
+                xt=jnp.array(latents_input),
+                alpha=alpha,
+                model_fn=model_fn
+            )
+            noise_pred = predict_eps_from_x(xt=jnp.array(latents_input), x=model_pred, alpha=alpha)
 
             noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
@@ -223,7 +228,8 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
         )
 
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
+        if hasattr(self.scheduler, "init_noise_sigma"):
+            latents = latents * self.scheduler.init_noise_sigma
 
         if debug:
             # run with python for loop

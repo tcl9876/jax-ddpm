@@ -11,11 +11,12 @@ from ml_collections.config_flags import config_flags
 from jax_modules.checkpoints import restore_checkpoint
 from jax_modules.unet import UNetTextConditioned
 from jax_modules.utils import save_tiled_imgs, to_fp32, to_bf16, unreplicate
+from jax_modules.optimizer import unshard_pytree
+from jax_modules.train_util import move_from_last_axis
 from tqdm.auto import tqdm
 import diffusers
 from diffusion.flax_pipeline import FlaxGeneralDiffusionPipeline 
 from diffusers import FlaxStableDiffusionPipeline as OriginalStablePipeline
-from datasets import datasets
 from transformers import FlaxT5EncoderModel, T5TokenizerFast, FlaxCLIPTextModel, CLIPTokenizerFast
 
 tf_set_visible_devices([], device_type="GPU")
@@ -62,11 +63,12 @@ def main(_):
     config = args.config
     config.unlock()
 
-    eval_schedule = config.model.eval_logsnr_schedule
+    eval_schedule = config.model.eval_alpha_schedule
     if eval_schedule.name == "cosine":
         scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="squaredcos_cap_v2")
     elif eval_schedule.name == "linear":
-        scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="linear", beta_start=eval_schedule.beta_start, beta_end=eval_schedule.beta_end)
+        scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="linear", 
+            beta_start=eval_schedule.beta_start, beta_end=eval_schedule.beta_end)
     else:
         raise NotImplementedError
 
@@ -99,7 +101,9 @@ def main(_):
     restored_sd = restore_checkpoint(args.checkpoint_dir, None) #restore the checkpoint as a dict.
     del restored_sd["optimizer_state"]
     step = restored_sd["step"]
-    unet_params = flax.jax_utils.unreplicate(restored_sd["params"])
+    #unet_params = restored_sd["params"]
+    unsharder = lambda tree: unshard_pytree(move_from_last_axis(tree))
+    unet_params = unreplicate(jax.pmap(unsharder, axis_name='i')(restored_sd["ema_params"]))
     print(f"Restored Checkpoint from {step} steps")
 
     #TODO: fix checkpoint, restore from ema_params, remove magic number args.height = 256
@@ -192,5 +196,3 @@ def main(_):
 
 if __name__ == '__main__':
     app.run(main)
-
-    

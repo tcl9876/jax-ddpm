@@ -200,7 +200,6 @@ class UNetTextConditioned(nn.Module):
 	num_res_blocks: int
 	attn_resolutions: Tuple[int]
 	dropout: float
-	logsnr_input_type: str
 
 	num_heads: Optional[int] = None
 	logsnr_scale_range: Tuple[float, float] = (-10., 10.)
@@ -213,7 +212,7 @@ class UNetTextConditioned(nn.Module):
 		self.unet = UNet(
 			ch=self.ch, emb_ch=self.emb_ch, out_ch=self.out_ch, 
 			ch_mult=self.ch_mult, num_res_blocks=self.num_res_blocks, attn_resolutions=self.attn_resolutions,
-			num_heads=self.num_heads, dropout=self.dropout, logsnr_input_type=self.logsnr_input_type, logsnr_scale_range=self.logsnr_scale_range,
+			num_heads=self.num_heads, dropout=self.dropout, logsnr_scale_range=self.logsnr_scale_range,
 			resblock_resample=self.resblock_resample, head_dim=self.head_dim, param_dtype=self.param_dtype
 		)
 		self.text_processor = SequenceProcessor(seq_width=self.seq_width)
@@ -223,9 +222,9 @@ class UNetTextConditioned(nn.Module):
 			context[key] = jnp.zeros_like(context[key])
 		return self.text_processor(clip_seq=context["clip_emb"], t5_seq=context["t5_emb"]).astype(self.param_dtype)
 		
-	def __call__(self, x, logsnr, context, *, train):
+	def __call__(self, x, alpha, context, *, train):
 		context = self.text_processor(clip_seq=context["clip_emb"], t5_seq=context["t5_emb"])
-		return self.unet(x, logsnr, context, train=train)
+		return self.unet(x, alpha, context, train=train)
 
 
 class UNet(nn.Module):
@@ -239,8 +238,7 @@ class UNet(nn.Module):
 	attn_resolutions: Tuple[int]
 	num_heads: Optional[int]
 	dropout: float
-
-	logsnr_input_type: str
+	
 	logsnr_scale_range: Tuple[float, float] = (-10., 10.)
 
 	resblock_resample: bool = False
@@ -248,29 +246,20 @@ class UNet(nn.Module):
 	param_dtype: Any = 'fp32'
 
 	@nn.compact
-	def __call__(self, x, logsnr, context, *, train):
+	def __call__(self, x, alpha, context, *, train):
 		B, H, W, _ = x.shape  # pylint: disable=invalid-name
 		assert H == W
-		assert x.dtype in (jnp.float32, jnp.float64)
-		assert logsnr.shape == (B,) and logsnr.dtype in (jnp.float32, jnp.float64)
+		assert x.dtype == jnp.float32
+		assert alpha.shape == (B,) and alpha.dtype == jnp.float32
 		num_resolutions = len(self.ch_mult)
 		ch = self.ch
 		emb_ch = self.emb_ch
 
-		# Timestep embedding
-		if self.logsnr_input_type == 'linear':
-			logging.info('LogSNR representation: linear')
-			logsnr_input = (logsnr - self.logsnr_scale_range[0]) / (
-					self.logsnr_scale_range[1] - self.logsnr_scale_range[0])
-		elif self.logsnr_input_type == 'sigmoid':
-			logging.info('LogSNR representation: sigmoid')
-			logsnr_input = nn.sigmoid(logsnr)
-		elif self.logsnr_input_type == 'inv_cos':
-			logging.info('LogSNR representation: inverse cosine')
-			logsnr_input = (jnp.arctan(jnp.exp(-0.5 * jnp.clip(logsnr, -15., 15.)))
-											/ (0.5 * jnp.pi))
-		else:
-			raise NotImplementedError(self.logsnr_input_type)
+
+		logsnr = jnp.log(alpha / (1 - alpha))
+		logsnr_input = (logsnr - self.logsnr_scale_range[0]) / (
+			self.logsnr_scale_range[1] - self.logsnr_scale_range[0])
+
 
 		if self.param_dtype == 'fp32':
 			param_dtype = jnp.float32
@@ -304,7 +293,7 @@ class UNet(nn.Module):
 						param_dtype=param_dtype)(
 								hs[-1], emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
-					h = FlaxTransformer2DModel(
+					h = nn.remat(FlaxTransformer2DModel)(
 							in_channels=h.shape[-1], 
 							n_heads=h.shape[-1]//self.head_dim, 
 							d_head=self.head_dim, 
@@ -320,7 +309,7 @@ class UNet(nn.Module):
 		h = hs[-1]
 		h = ResnetBlock(dropout=self.dropout, name='mid.block_1', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
-		h = FlaxTransformer2DModel(
+		h = nn.remat(FlaxTransformer2DModel)(
 				in_channels=h.shape[-1], n_heads=h.shape[-1]//self.head_dim, d_head=self.head_dim, param_dtype=param_dtype)(h, context)
 		h = ResnetBlock(dropout=self.dropout, name='mid.block_2', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
@@ -337,7 +326,7 @@ class UNet(nn.Module):
 								jnp.concatenate([h, hs.pop()], axis=-1),
 								emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
-					h = FlaxTransformer2DModel(
+					h = nn.remat(FlaxTransformer2DModel)(
 							in_channels=h.shape[-1], 
 							n_heads=h.shape[-1]//self.head_dim, 
 							d_head=self.head_dim, 
@@ -350,6 +339,7 @@ class UNet(nn.Module):
 		assert not hs
 
 		# End
+		h = h.astype('float32')
 		h = nonlinearity(Normalize(name='norm_out')(h))
 		least_multof8 = int(np.ceil(self.out_ch/8) * 8) #force output to have 8 channels to allow sharding across the 8 cores. then discard the extra channels.
 		h = nn.Conv(
@@ -357,7 +347,8 @@ class UNet(nn.Module):
 				kernel_size=(3, 3),
 				strides=(1, 1),
 				kernel_init=nn.initializers.zeros,
-				name='conv_out')(h.astype('float32'))[..., :self.out_ch]
+				dtype=jnp.float32,
+				name='conv_out')(h)[..., :self.out_ch]
 
 		assert h.shape == (*x.shape[:3], self.out_ch)
 		return h
