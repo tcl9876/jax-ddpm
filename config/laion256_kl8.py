@@ -84,7 +84,7 @@ def get_config():
             checkpoint_dirs=["{}/checkpoints_recent", "{}/checkpoints_permanent"],  
             num_checkpoints=[10, 999999],
             save_freq=[10000, 100000],
-            iterations=1000001
+            iterations=100001
 
         ),
     )

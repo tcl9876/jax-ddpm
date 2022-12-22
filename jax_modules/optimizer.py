@@ -27,9 +27,9 @@ def make_adam(config):
     if config.train.weight_decay > 0.:
         optimizer_kwargs['weight_decay'] = config.train.weight_decay
 
-    learning_rate = CosineDecay(0.0, config.train.learning_rate, config.train.learning_rate, 1000, 1000000)
+    learning_rate = CosineDecay(0.0, config.train.learning_rate, config.train.learning_rate, config.train.learning_rate_warmup_steps, config.train.get('decay_steps', config.train.iterations))
     if config.train.optimizer == 'adam':
-        optimizer = optax.adam(
+        optimizer = optax.adamw(
             **optimizer_kwargs,
             b1=config.train.get('adam_beta1', 0.9),
             b2=config.train.get('adam_beta2', 0.999),

@@ -1,5 +1,3 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
-setup(name="jax-ddpm",
-    py_modules=["jax_modules", "diffusion", "datasets"]
-)
+setup(name="jax-ddpm", packages=find_packages())

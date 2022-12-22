@@ -27,7 +27,6 @@ import numpy as onp
 import PIL
 from tensorflow.io import gfile
 import time
-import transformers
 
 def unreplicate(x):
     return jax.device_get(flax.jax_utils.unreplicate(x))
@@ -320,8 +319,17 @@ def broadcast_from_left(x, shape):
 			x.reshape(x.shape + (1,) * (len(shape) - x.ndim)),
 			shape)
 
-def list_devices():
+def list_devices(force_no_cpu=True):
+	devices = jax.devices()
+
+	if devices[0].platform == 'cpu' and force_no_cpu:
+		error_msg = \
+		"""Stopping process as Jax couldn't detect TPU/GPU. 
+		If on a TPU, make sure to run pip install "jax[tpu]==0.3.17" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+		If you did that, perhaps try doing 'pkill -9 python && sudo rm -rf /tmp/tpu_logs /tmp/libtpu_lockfile' as per https://github.com/google/jax/issues/10192"""
+		raise RuntimeError(error_msg)
+
 	if jax.process_index() == 0:
-		print("DEVICES: ", jax.devices())
-	else:
-		print(f"global device count: {jax.device_count()}, device count on node {jax.process_index()}: {jax.local_device_count}")
+		print("DEVICES: ", devices)
+	
+	print(f"global device count: {len(devices)}, device count on node {jax.process_index()}: {jax.local_device_count}")

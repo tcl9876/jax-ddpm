@@ -31,30 +31,6 @@ class LN32(nn.Module):
 		normx_32 = nn.normalization.LayerNorm(epsilon=1e-5)(x.astype('float32'))
 		return normx_32.astype(x_dtype)
 
-class SequenceProcessor(nn.Module):
-    seq_width: Optional[int] = 1024
-    @nn.compact
-    def __call__(self, clip_seq, t5_seq):
-        """
-        does several things:
-        1) applies layernormalization + linear transformation separately to both, as t5 seq may have different variance, and they'll eventually be projected by the same weight matrices.
-        2) prepends a null embedding to the sequence, similar to https://arxiv.org/pdf/2211.01324.pdf. 
-        3) concatenates the sequences.
-        """
-        
-        b, hc, ht5 = clip_seq.shape[0], clip_seq.shape[-1], t5_seq.shape[-1]
-        if self.seq_width is None: 
-            seq_width = hc
-        else:
-            seq_width = self.seq_width
-
-        assert hc%seq_width == 0 and ht5%seq_width == 0
-        clip_seq = nn.Dense(seq_width)(clip_seq)
-        t5_seq = nn.Dense(seq_width)(t5_seq * 4.0) #t5 sequence has less variance
-        
-        null_emb = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
-        return jnp.concatenate([null_emb, clip_seq, t5_seq], axis=1)
-
 def max_pow2_that_evenly_divides(n):
     i = 1
     while n%2 ==0:
@@ -78,8 +54,10 @@ def scan_att(q, k, v, scale, n_splits):
     outs = jax.lax.scan(scanfn, None, [nq, nk, nv])[1]
     return outs.reshape(-1, outs.shape[-2], outs.shape[-1])
 
-#a self attention that limits memory usage dynamically by looking at the sizes of q and k. it is exactly equivalent to scaled_dp_attention.
-#by default, dont store more than ~= a single 8-headed 32^2 SA matrix.
+"""
+a self attention that limits memory usage dynamically by looking at the sizes of q and k. it is exactly equivalent to scaled_dp_attention.
+by default, dont store more than ~= a single 8-headed 32^2 SA matrix.
+"""
 def lowmem_dot_product_attention(q, k, v, scale, max_allowable=(1024 * 1024 * 8)):
     #SHAPE: (batch_size * head_size, seq_len, dim // head_size)
 
@@ -185,6 +163,7 @@ class FlaxBasicTransformerBlock(nn.Module):
     dropout: float = 0.0
     only_cross_attention: bool = False
     param_dtype: jnp.dtype = jnp.float32
+    use_glu: bool = True
 
     def setup(self):
         # self attention (or nothing if only_cross_attention is True)
@@ -196,7 +175,7 @@ class FlaxBasicTransformerBlock(nn.Module):
             self.norm1 = None
         # cross attention
         self.attn2 = nn.remat(FlaxAttentionBlock)(self.dim, self.n_heads, self.d_head, self.dropout, param_dtype=self.param_dtype)
-        self.ff = nn.remat(FlaxGluFeedForward)(dim=self.dim, dropout=self.dropout, param_dtype=self.param_dtype)
+        self.ff = nn.remat(FlaxFeedForward)(dim=self.dim, dropout=self.dropout, param_dtype=self.param_dtype, use_glu=self.use_glu)
         self.norm2 = LN32()
         self.norm3 = LN32()
 
@@ -314,7 +293,7 @@ class FlaxTransformer2DModel(nn.Module):
         return hidden_states
 
 
-class FlaxGluFeedForward(nn.Module):
+class FlaxFeedForward(nn.Module):
     r"""
     Flax module that encapsulates two Linear layers separated by a gated linear unit activation from:
     https://arxiv.org/abs/2002.05202
@@ -329,11 +308,15 @@ class FlaxGluFeedForward(nn.Module):
     dim: int
     dropout: float = 0.0
     param_dtype: jnp.dtype = jnp.float32
+    use_glu: bool = True
 
     def setup(self):
         # The second linear layer needs to be called
         # net_2 for now to match the index of the Sequential layer
-        self.net_0 = FlaxGEGLU(self.dim, self.dropout, self.param_dtype)
+        if self.use_glu:
+            self.net_0 = FlaxGEGLU(self.dim, self.dropout, self.param_dtype)
+        else:
+            self.net_0 = nn.Dense(self.dim * 4, dtype=self.param_dtype, param_dtype=self.param_dtype)
         self.net_2 = nn.Dense(self.dim, dtype=self.param_dtype, param_dtype=self.param_dtype)
 
     def __call__(self, hidden_states, deterministic=True):

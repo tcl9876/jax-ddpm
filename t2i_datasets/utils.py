@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from jax_modules.utils import numpy_iter
 from tensorflow.io import gfile
 import os
+import webdataset as wds
 
 def read_encoded(example):
     features = {
@@ -24,7 +25,7 @@ def read_encoded(example):
 
     return example
 
-#decodes the image space dataset (usually result from img2dataset)
+#decodes the image space dataset (usually result from img2dataset stored as tfrecord).
 def read_pixels(example):
     features = {
         "key": tf.io.FixedLenFeature([], tf.string),
@@ -58,6 +59,7 @@ def make_encoders_fn(vae, clip_text_module, t5_module):
 
     return encoders_fn
 
+
 def all_tfrecords(data_dir):
     tfrecords_list = []
     for dirpath, dirs, files in gfile.walk(data_dir):
@@ -85,6 +87,42 @@ def build_tfrecord_dataset(data_dirs, batch_sizes, map_fn, process_index, proces
 
     dataset = dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.shard(index=process_index, num_shards=process_count)
+    if repeating:
+        dataset = dataset.repeat()
+
+    for batch_size in batch_sizes:
+        dataset = dataset.batch(batch_size)
+    dataset = numpy_iter(dataset.prefetch(tf.data.AUTOTUNE))
+    return dataset
+
+
+def build_webdataset_image_reader(filenames, batch_sizes, process_index, process_count, columns=["jpg", "txt"], repeating=False, verbose=True):
+
+    local_filenames = sorted(filenames)[process_index::process_count] #shard at the file level. each node will grab their slice of the .tar files.
+
+    if verbose:
+        print(f"On process index {process_index} out of {process_count}, using the following filenames: ")
+        print(local_filenames)
+    
+    wds_dataset = wds.WebDataset(local_filenames, handler=wds.warn_and_continue).to_tuple(*columns)
+
+    def yielder():
+        for x in wds_dataset:
+            yield x
+    
+    #if columns includes aesthetic score, will need to append tf.Tensorspec(shape=(), dtype=tf.float32) to the output_signature
+    dataset = tf.data.Dataset.from_generator(
+        yielder,
+        output_signature=(
+            tf.TensorSpec(shape=(), dtype=tf.string),
+            tf.TensorSpec(shape=(), dtype=tf.string)
+        )
+    )
+
+    def read_wds_tuple(jpeg, caption):
+        return tf.io.decode_jpeg(jpeg, 3), caption
+    
+    dataset = dataset.map(read_wds_tuple, num_parallel_calls=tf.data.AUTOTUNE)
     if repeating:
         dataset = dataset.repeat()
 

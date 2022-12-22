@@ -20,6 +20,7 @@ if __name__ == '__main__':
     parser.add_argument('--input_format', type=str, help='input format', default='parquet')
     parser.add_argument('--resize_mode', type=str, help='resize mode', default='center_crop')
     parser.add_argument('--max_aspect_ratio', type=str, help='max aspect ratio', default='2.5')
+    
 
     args = parser.parse_args()
     print(args)

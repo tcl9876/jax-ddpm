@@ -25,7 +25,7 @@ from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-from .attention import FlaxTransformer2DModel, SequenceProcessor, FlaxGluFeedForward
+from .attention import FlaxTransformer2DModel
 
 def nonlinearity(x):
 	return x * nn.sigmoid(1.702 * x)
@@ -41,7 +41,7 @@ class Normalize(nn.Module):
 
 
 def get_timestep_embedding(timesteps, embedding_dim,
-													 max_time=1000., dtype=jnp.float32):
+							max_time=1000., dtype=jnp.float32):
 	"""Build sinusoidal embeddings (from Fairseq).
 
 	This matches the implementation in tensor2tensor, but differs slightly
@@ -69,7 +69,11 @@ def get_timestep_embedding(timesteps, embedding_dim,
 	assert emb.shape == (timesteps.shape[0], embedding_dim)
 	return emb
 
-#2d positional embedding like ViT. adapted from https://github.com/ericl122333/PatchDiffusion-Pytorch/blob/main/patch_diffusion/nn.py
+"""
+2d positional embedding like ViT. adapted from https://github.com/ericl122333/PatchDiffusion-Pytorch/blob/main/patch_diffusion/nn.py
+a model that's given absolute positions might be better at spatial relationships, eg for prompts like 'a red cube *on top of* a blue cube'
+positional encoding is injected right after the input conv. 
+"""
 def timestep_embedding_2d(dim, resolution):
     omega = 64 / resolution   #higher resolutions need longer wavelengths
     half_dim = dim // 2
@@ -93,7 +97,7 @@ def nearest_neighbor_upsample(x):
 	return x.reshape(B, H * 2, W * 2, C)
 
 
-class ResnetBlockNoFFN(nn.Module):
+class ResnetBlock(nn.Module):
 	"""Convolutional residual block."""
 
 	dropout: float
@@ -141,94 +145,35 @@ class ResnetBlockNoFFN(nn.Module):
 		return x + h
 
 
+class SequenceProcessor(nn.Module):
+    seq_width: Optional[int] = 1024
+    t5_mult: float = 4.0
+    @nn.compact
+    def __call__(self, context):
+        """
+        does several things:
+        1) applies linear transformation separately to clip_seq and t5_seq. t5_seq has less variance so we multiply it by a constant
+        2) prepends a null embedding to the sequence, similar to https://arxiv.org/pdf/2211.01324.pdf. 
+        3) concatenates the sequences.
+        """
+        clip_seq, t5_seq = context["clip_seq"], context["t5_seq"]
 
-class ResnetBlock(nn.Module):
-	"""Convolutional residual block."""
+        b, hc, ht5 = clip_seq.shape[0], clip_seq.shape[-1], t5_seq.shape[-1]
+        if self.seq_width is None: 
+            seq_width = hc
+        else:
+            seq_width = self.seq_width
 
-	dropout: float
-	out_ch: Optional[int] = None
-	resample: Optional[str] = None
-	param_dtype: Optional[Any] = jnp.float32
-
-	@nn.compact
-	def __call__(self, x, *, emb, deterministic):
-		B, _, _, C = x.shape  # pylint: disable=invalid-name
-		assert emb.shape[0] == B and len(emb.shape) == 2
-		out_ch = C if self.out_ch is None else self.out_ch
-		
-		h = nonlinearity(Normalize(name='norm1')(x))
-		if self.resample is not None:
-			updown = lambda z: {
-					'up': nearest_neighbor_upsample(z),
-					'down': nn.avg_pool(z, (2, 2), (2, 2))
-			}[self.resample]
-			h = updown(h)
-			x = updown(x)
-		h = nn.Conv(
-				features=out_ch, kernel_size=(3, 3), strides=(1, 1), name='conv1', dtype=self.param_dtype, param_dtype=self.param_dtype)(h)
-		
-		h = nonlinearity(Normalize(name='norm2')(h))
-		h = nn.Conv(
-				features=out_ch, kernel_size=(3, 3), strides=(1, 1), name='conv2', dtype=self.param_dtype, param_dtype=self.param_dtype)(h)
-
-		# add in timestep/class embedding
-		emb_out = nn.Dense(features=2 * out_ch, name='temb_proj', dtype=self.param_dtype, param_dtype=self.param_dtype)(
-				nonlinearity(emb))[:, None, None, :]
-		scale, shift = jnp.split(emb_out, 2, axis=-1)
-		h = Normalize(name='norm3')(h) * (1 + scale) + shift
-		# rest
-		h = nonlinearity(h)
-		h = nn.Dropout(rate=self.dropout)(h, deterministic=deterministic)
-
-		h = FlaxGluFeedForward(dim=out_ch, param_dtype=self.param_dtype)(h)
-
-		if C != out_ch:
-			x = nn.Dense(features=out_ch, name='nin_shortcut', dtype=self.param_dtype, param_dtype=self.param_dtype)(x)
-
-		assert x.shape == h.shape, f"{x.shape}, {h.shape}"
-		return x + h
+        assert hc%seq_width == 0 and ht5%seq_width == 0
+        clip_seq = nn.Dense(seq_width)(clip_seq)
+        t5_seq = nn.Dense(seq_width)(t5_seq * self.t5_mult)
+        
+        null_emb = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
+        return jnp.concatenate([null_emb, clip_seq, t5_seq], axis=1)
 
 
 class UNetTextConditioned(nn.Module):
 	"""The UNet architecture w/ t5 and clip encoding handling."""
-
-	ch: int
-	emb_ch: int
-	out_ch: int
-	seq_width: int
-	ch_mult: Tuple[int]
-	num_res_blocks: int
-	attn_resolutions: Tuple[int]
-	dropout: float
-
-	num_heads: Optional[int] = None
-	logsnr_scale_range: Tuple[float, float] = (-10., 10.)
-	resblock_resample: bool = False
-	head_dim: Optional[int] = None  # alternative to num_heads
-	param_dtype: Any = 'fp32'
-
-	def setup(self):
-		
-		self.unet = UNet(
-			ch=self.ch, emb_ch=self.emb_ch, out_ch=self.out_ch, 
-			ch_mult=self.ch_mult, num_res_blocks=self.num_res_blocks, attn_resolutions=self.attn_resolutions,
-			num_heads=self.num_heads, dropout=self.dropout, logsnr_scale_range=self.logsnr_scale_range,
-			resblock_resample=self.resblock_resample, head_dim=self.head_dim, param_dtype=self.param_dtype
-		)
-		self.text_processor = SequenceProcessor(seq_width=self.seq_width)
-	
-	def prepare_uncond_conditioning(self, context):
-		for key in ["clip_emb", "t5_emb"]:
-			context[key] = jnp.zeros_like(context[key])
-		return self.text_processor(clip_seq=context["clip_emb"], t5_seq=context["t5_emb"]).astype(self.param_dtype)
-		
-	def __call__(self, x, alpha, context, *, train):
-		context = self.text_processor(clip_seq=context["clip_emb"], t5_seq=context["t5_emb"])
-		return self.unet(x, alpha, context, train=train)
-
-
-class UNet(nn.Module):
-	"""The UNet architecture , with x-attn but without sequence embedding related things (it expects the processed sequence for context) """
 
 	ch: int
 	emb_ch: int
@@ -244,9 +189,14 @@ class UNet(nn.Module):
 	resblock_resample: bool = False
 	head_dim: Optional[int] = None  # alternative to num_heads
 	param_dtype: Any = 'fp32'
+	use_glu: bool = False
+	t5_mult: float = 4.0
 
 	@nn.compact
 	def __call__(self, x, alpha, context, *, train):
+		text_processor = SequenceProcessor(seq_width=self.seq_width, t5_mult=self.t5_mult)
+		context = text_processor(context)
+		
 		B, H, W, _ = x.shape  # pylint: disable=invalid-name
 		assert H == W
 		assert x.dtype == jnp.float32
@@ -268,7 +218,7 @@ class UNet(nn.Module):
 		
 		print("PARAM DTYPE:", param_dtype)
 
-		emb = get_timestep_embedding(logsnr_input, embedding_dim=ch, max_time=1.)
+		emb = get_timestep_embedding(logsnr_input, embedding_dim=emb_ch, max_time=1.)
 		emb = nn.Dense(features=emb_ch, name='dense0')(emb)
 		emb = nn.Dense(features=emb_ch, name='dense1')(nonlinearity(emb))
 		assert emb.shape == (B, emb_ch)
@@ -282,18 +232,25 @@ class UNet(nn.Module):
 		assert pe.shape[1:] == hs[0].shape[1:]
 		hs= [hs[0].astype(param_dtype) + pe.astype(param_dtype)]
 
+		def maybe_remat(block, i_level):
+			#dont remat the bottom block because it doesn't use much memory.
+			if i_level <= 2:
+				return nn.remat(block)
+			else:
+				return block
+
 		# Downsampling
 		for i_level in range(num_resolutions):
 			# Residual blocks for this resolution
 			for i_block in range(self.num_res_blocks):
-				h = nn.remat(ResnetBlock)(
+				h = maybe_remat(ResnetBlock, i_level)(
 						out_ch=ch * self.ch_mult[i_level],
 						dropout=self.dropout,
 						name=f'down_{i_level}.block_{i_block}',
 						param_dtype=param_dtype)(
 								hs[-1], emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
-					h = nn.remat(FlaxTransformer2DModel)(
+					h = maybe_remat(FlaxTransformer2DModel, i_level)(
 							in_channels=h.shape[-1], 
 							n_heads=h.shape[-1]//self.head_dim, 
 							d_head=self.head_dim, 
@@ -309,7 +266,7 @@ class UNet(nn.Module):
 		h = hs[-1]
 		h = ResnetBlock(dropout=self.dropout, name='mid.block_1', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
-		h = nn.remat(FlaxTransformer2DModel)(
+		h = FlaxTransformer2DModel(
 				in_channels=h.shape[-1], n_heads=h.shape[-1]//self.head_dim, d_head=self.head_dim, param_dtype=param_dtype)(h, context)
 		h = ResnetBlock(dropout=self.dropout, name='mid.block_2', param_dtype=param_dtype)(
 				h, emb=emb, deterministic=not train)
@@ -318,7 +275,7 @@ class UNet(nn.Module):
 		for i_level in reversed(range(num_resolutions)):
 			# Residual blocks for this resolution
 			for i_block in range(self.num_res_blocks + 1):
-				h = nn.remat(ResnetBlock)(
+				h = maybe_remat(ResnetBlock, i_level)(
 						out_ch=ch * self.ch_mult[i_level],
 						dropout=self.dropout,
 						name=f'up_{i_level}.block_{i_block}',
@@ -326,7 +283,7 @@ class UNet(nn.Module):
 								jnp.concatenate([h, hs.pop()], axis=-1),
 								emb=emb, deterministic=not train)
 				if h.shape[1] in self.attn_resolutions:
-					h = nn.remat(FlaxTransformer2DModel)(
+					h = maybe_remat(FlaxTransformer2DModel, i_level)(
 							in_channels=h.shape[-1], 
 							n_heads=h.shape[-1]//self.head_dim, 
 							d_head=self.head_dim, 

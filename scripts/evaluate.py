@@ -26,12 +26,11 @@ jnp.set_printoptions(precision=4)
 
 args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
-flags.DEFINE_string("prompt", "a cat watching TV, a blue shirt, a red cube on top of a blue cube, a green clock in a pentagon shape, an armchair in the shape of an avocado", "the prompt.")
+flags.DEFINE_string("prompt", "a cat watching TV; a blue shirt; a red cube on top of a blue cube; a green clock in a pentagon shape; an armchair in the shape of an avocado", "the prompt.")
 flags.DEFINE_string("checkpoint_dir", None, "the global directory you will load all training stuff from.")
 flags.DEFINE_string("wandb_project", None, "if you are using wandb to manage experiments, the project name.")
 flags.DEFINE_string("wandb_run", None, "if you are using wandb to manage experiments, the experiment run name.")
 flags.DEFINE_string("save_dir", None, "the directory to save your results to.")
-#flags.DEFINE_string("n_samples", "36", "the number of samples you want to create. can be comma-separated list.")
 flags.DEFINE_integer("n_steps", 200, "how many evaluation steps you want to use")
 flags.DEFINE_integer("max_batch_size", 64, "the maximum allowable batch size for sampling.")
 flags.DEFINE_string("auth_token", None, "hugging face authentication token for Stable Diffusion.")
@@ -39,8 +38,6 @@ flags.DEFINE_integer("height", 256, "image height.")
 flags.DEFINE_integer("width", 256, "image width.")
 flags.DEFINE_integer("ncol", 8, "if you are making a grid, the number of columns in the grid.")
 flags.DEFINE_string("guidance_scale", "1.0", "the guidance weight for classifier-free guidance.")
-flags.DEFINE_string("clip_model_id", "laion/CLIP-ViT-H-14-laion2B-s32B-b79K", "clip config (from HF transformers)")
-flags.DEFINE_string("t5_model_id", "t5-3b", "t5 config (from HF transformers)") #SWITCH TO 11B!
 flags.DEFINE_string("save_format", "grid", "either 'grid' or 'npz'. determines whether to save results as a grid of images (default, best for <= 100 images), or as an .npz file (for evaluation).")
 flags.mark_flags_as_required(["config", "prompt", "checkpoint_dir", "save_dir"])
 
@@ -75,23 +72,22 @@ def main(_):
     scheduler_state = scheduler.create_state()
     #we only support using DDIM, in practice we'd use Pytorch version of diffusers schedulers, a lot more support for those.
     
-    prompt_list = args.prompt.split(",")
+    prompt_list = args.prompt.split(";")
 
     with jax.default_device(jax.devices("cpu")[0]):
-        clip_text_model = FlaxCLIPTextModel.from_pretrained(args.clip_model_id, from_pt=True, dtype=jnp.bfloat16) #bfloat has no effect?
+        clip_text_model = FlaxCLIPTextModel.from_pretrained(config.model.clip_model_id, from_pt=True, dtype=jnp.bfloat16)
         clip_text_module, clip_text_params = clip_text_model.module, clip_text_model.params
-        clip_text_params = to_bf16(clip_text_params)
-        clip_tokenizer = CLIPTokenizerFast.from_pretrained(args.clip_model_id)
+        clip_text_params = to_bf16(clip_text_params) #loading in bfloat seems to have no effect, so cast params
+        clip_tokenizer = CLIPTokenizerFast.from_pretrained(config.model.clip_model_id)
 
-        t5_model = FlaxT5EncoderModel.from_pretrained(args.t5_model_id, from_pt=True, dtype=jnp.bfloat16) #bfloat has no effect?  
+        t5_model = FlaxT5EncoderModel.from_pretrained(config.model.t5_model_id, from_pt=True, dtype=jnp.bfloat16)
         t5_module, t5_params = t5_model.module, t5_model.params
-        t5_params = to_bf16(t5_params)
-        t5_tokenizer = T5TokenizerFast.from_pretrained(args.t5_model_id, model_max_length=77)
+        t5_params = to_bf16(t5_params)  #loading in bfloat seems to have no effect, so cast params
+        t5_tokenizer = T5TokenizerFast.from_pretrained(config.model.t5_model_id, model_max_length=77)
 
         clip_emb, t5_emb = encode_caption(clip_text_module, t5_module, clip_tokenizer, t5_tokenizer, prompt_list, clip_text_params, t5_params)
-        clip_emb = jnp.repeat(clip_emb, args.ncol, axis=0)
+        clip_emb = jnp.repeat(clip_emb, args.ncol, axis=0) #use the same text embeddings for the entire row.
         t5_emb = jnp.repeat(t5_emb, args.ncol, axis=0)
-        #jnp.stack([clip_emb[i] * args.ncol for i in range(len(clip_emb))], axis=0)
     
     context = {
         "clip_emb": flax.jax_utils.replicate(clip_emb),
@@ -101,12 +97,10 @@ def main(_):
     restored_sd = restore_checkpoint(args.checkpoint_dir, None) #restore the checkpoint as a dict.
     del restored_sd["optimizer_state"]
     step = restored_sd["step"]
-    #unet_params = restored_sd["params"]
     unsharder = lambda tree: unshard_pytree(move_from_last_axis(tree))
     unet_params = unreplicate(jax.pmap(unsharder, axis_name='i')(restored_sd["ema_params"]))
     print(f"Restored Checkpoint from {step} steps")
 
-    #TODO: fix checkpoint, restore from ema_params, remove magic number args.height = 256
     params = {
         "unet": to_fp32(unet_params),
         "scheduler": scheduler_state
@@ -146,8 +140,6 @@ def main(_):
         batch_size = min(args.max_batch_size, n_samples - n)
         global_rng, *rng = jax.random.split(global_rng, jax.device_count() + 1)
         rng = jax.device_put_sharded(rng, jax.devices())
-
-        per_replica_bs = args.max_batch_size//jax.device_count()
 
         current_images, latents = pipe(
             prompt_ids=context,

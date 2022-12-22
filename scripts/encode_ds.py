@@ -8,7 +8,7 @@ import gc
 import jax.numpy as jnp
 import os
 from jax_modules.utils import numpy_iter, to_bf16, list_devices
-from t2i_datasets.utils import make_encoders_fn, read_pixels, build_tfrecord_dataset
+from t2i_datasets.utils import make_encoders_fn, read_pixels, build_tfrecord_dataset, build_webdataset_image_reader
 from absl import app, flags
 from ml_collections.config_flags import config_flags
 import logging
@@ -19,7 +19,8 @@ args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
 flags.DEFINE_string("write_dir", None, "the global directory you will save the encodings into.")
 flags.DEFINE_string("data_dir", None, "the directory where your data is stored")
-flags.DEFINE_integer("batch_size", 512, "global batch size ")
+flags.DEFINE_string("image_format", "frecord", "the format of your image data, either 'tfrecord' or 'webdataset'.")
+flags.DEFINE_integer("batch_size", 512, "global batch size")
 flags.mark_flags_as_required(["write_dir", "data_dir"])
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,11 @@ def main(_):
 
     encoders_fn = make_encoders_fn(vae, clip_text_module, t5_module)
     encoders_fn = jax.pmap(encoders_fn) #jax.pmap(lambda a,b,c,d,e,f: (None, None, None)) #
-    full_image_dataset = build_tfrecord_dataset(args.data_dir, batch_sizes=[args.batch_size], map_fn=read_pixels, process_index=jax.process_index(), process_count=jax.process_count(), repeating=False)
+
+    if args.image_format == 'tfrecord':
+        full_image_dataset = build_tfrecord_dataset(args.data_dir, batch_sizes=[args.batch_size], map_fn=read_pixels, process_index=jax.process_index(), process_count=jax.process_count(), repeating=False)
+    else:
+        full_image_dataset = build_webdataset_image_reader(args.filenames, batch_sizes=[args.batch_size], process_index=jax.process_index(), process_count=jax.process_count(), repeating=False, verbose=True)
 
     logfile_path = os.path.join(args.write_dir, 'logfile.txt')
     if not gfile.exists(logfile_path) and jax.process_index() == 0:

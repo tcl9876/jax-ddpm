@@ -165,10 +165,12 @@ def restore_checkpoint(ckpt_dir, target, step=None, prefix='checkpoint_', make_r
 		if ckpt_path is not None:
 			print(f"Attempting to restore checkpoint from {ckpt_path}")
 			with gfile.GFile(ckpt_path, 'rb') as fp:
-				restored_state = serialization.from_bytes(target, fp.read())
+				target = serialization.from_bytes(target, fp.read())
+
 			if make_replicated:
-				restored_state = state_make_replicated(restored_state)
-			return restored_state
+				target = state_make_replicated(target)
+
+			return target
 		else:
 			print(f"No checkpoint found in {ckpt_dir}. Restoring original state.")
 			return target
@@ -181,13 +183,6 @@ def state_make_unreplicated(state):
 		#accum_step = unreplicate(cpu_state.accum_step),
 		params = unreplicate(cpu_state.params),
 	)
-	"""
-	return state.replace(
-        step = unreplicate(state.step),
-        accum_step = unreplicate(state.accum_step),
-        params = unreplicate(state.params),
-    )
-	"""
 	
 def state_make_replicated(state):
 	return state.replace(

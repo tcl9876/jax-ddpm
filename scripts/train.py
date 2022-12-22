@@ -1,11 +1,9 @@
 import os
 import time
-import functools
 import jax
-import flax
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-from jax_modules.train_util import Trainer, Metrics
+from jax_modules.train_util import Trainer
 from jax_modules.checkpoints import save_checkpoint, restore_checkpoint, state_make_unreplicated
 from jax_modules.utils import unreplicate, barrier, list_devices
 from tensorflow.io import gfile, write_file
@@ -31,7 +29,6 @@ def main(_):
         gfile.makedirs(global_dir)
     
     targs = config.train
-    #dargs.batch_size = targs.batch_size #set tfds dataloader batch size based on specified batch size in training args.
     targs.checkpoint_dirs = [subdir.format(global_dir) for subdir in targs.checkpoint_dirs]
     targs.log_dir = targs.log_dir.format(global_dir)
     ismain = (jax.process_index() == 0)
@@ -54,7 +51,7 @@ def main(_):
             #print and log a dict of kwargs.
             metric_dict = kwargs.pop("metrics")
             if use_wandb:
-                wandb.log(metric_dict.to_dict())
+                wandb.log(metric_dict)
                 wandb.log(kwargs)
             printed_string = ""
             for k, v in kwargs.items():
@@ -79,8 +76,10 @@ def main(_):
     trainer = Trainer(config, dataset=dataset_info_obj)
     state = trainer.make_init_state()
     state = restore_checkpoint(targs.checkpoint_dirs[0], state, make_replicated=True)
-    
-    devices = jax.local_devices()
+
+    devices = jax.devices()
+    local_devices = jax.local_devices()
+    local_device_count = jax.local_device_count()
     start_step = int(unreplicate(state.step))
     barrier()
 
@@ -89,8 +88,8 @@ def main(_):
         print("training devices:", devices)
         print("device count:", len(devices))
 
-    fb_step = jax.pmap(trainer.forward_backward, axis_name='batch')
-    update_func = jax.pmap(trainer.update_fn, axis_name='i')
+    fb_step = jax.pmap(trainer.forward_backward, axis_name='batch', devices=devices) #fb_step will all-reduce grads over all nodes, so devices includes all devices
+    update_func = jax.pmap(trainer.update_fn, axis_name='i', devices=local_devices) #the state update is run independently on each node, so devices only include local devices
 
     train_iter = build_tfrecord_dataset(args.data_dir, batch_sizes=[targs.batch_size//jax.local_device_count(), jax.local_device_count()],
         map_fn=read_encoded, process_index=jax.process_index(), process_count=jax.process_count(), repeating=True, sampling_probs=args.sampling_probs)
@@ -100,10 +99,6 @@ def main(_):
         print("batch shapes:")
         jax.tree_map(lambda x: print(x.shape), next(train_iter))
     
-    devices = jax.devices()
-    local_devices = jax.local_devices()
-    local_device_count = jax.local_device_count()
-
     local_core_on_chip = jax.device_put_sharded([jax.numpy.int32(i) for i in range(8)], local_devices)  
     global_rng = jax.random.PRNGKey(jax.process_index()) #set seed to process index so different nodes dont receive same rngs
     loss_metric = jax.device_put_replicated(jax.numpy.float32(0.), local_devices)
@@ -112,13 +107,11 @@ def main(_):
     for global_step in range(start_step, targs.iterations + 1):
         batch = next(train_iter)
         global_rng, *train_step_rng = jax.random.split(global_rng, num=local_device_count + 1)
-        train_step_rng = jax.device_put_sharded(train_step_rng, devices)
+        train_step_rng = jax.device_put_sharded(train_step_rng, local_devices)
 
         grad, loss_metric, gnorm_metric = fb_step(train_step_rng, batch, state, local_core_on_chip, loss_metric, gnorm_metric)         
-        state = update_func(state, grad)   
-        
-        # barrier() #TODO: experiment both with and without barrier on v3-32, benchmark speeds for each. 
-        #why does it work for 2 steps but not 3? this happens with multiple models
+        state = update_func(state, grad)
+        # barrier() #is a barrier needed or will it wait normally? 
 
         if global_step < 10: print('A step was successfully completed')
 
@@ -126,7 +119,7 @@ def main(_):
             loss_unrep = unreplicate(loss_metric) / targs.log_loss_every_steps
             gnorm_unrep = unreplicate(gnorm_metric) / targs.log_loss_every_steps
             kwargs = {
-                "step": global_step + start_step,
+                "step": global_step,
                 "metrics": {
                     "loss": loss_unrep,
                     "gnorm": gnorm_unrep,
@@ -143,9 +136,6 @@ def main(_):
             if global_step%save_freq==0 and ismain:
                 state_unrep = state_make_unreplicated(state)
                 save_checkpoint(checkpoint_dir, state_unrep, keep=num_checkpoints, step=state_unrep.step)
-                
-#checkpoints saving has a very large alloc? fix this?
-#INIT STEP IS ALWAYS ZERO: FIX THIS
 
 if __name__ == '__main__':
     app.run(main)

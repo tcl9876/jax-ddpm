@@ -22,8 +22,6 @@
 # pylint:disable=g-long-lambda
 
 from jax_modules import utils
-from absl import logging
-from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as onp
@@ -80,6 +78,7 @@ class DiffusionWrapper:
 		self.logvar_coeff = logvar_coeff
 		self.alpha_set = get_alpha_set(**alpha_schedule)
 		self.tmin = tmin
+		
 
 	def _run_model(self, *, xt, alpha, model_fn):
 		model_output = model_fn(xt, alpha)
@@ -107,7 +106,10 @@ class DiffusionWrapper:
 		eps = jax.random.normal(next(rng), shape=x.shape, dtype=x.dtype)
 		bc = lambda z: utils.broadcast_from_left(z, x.shape)
 
-
+		"""discrete time, with t ~ U(tmin, num_steps). 
+		The reason why a tmin > 0 might be used is because at t~=0, SNR(t) grows very high. 
+		When weighting the reconstruction loss by SNR(t) this might cause the early timesteps to have disporportionately high loss values/gradient signals.
+		Also, in practice, relatively few steps are used for sampling, e.g. w/ 50 steps it might be [19, 39, ... 999], so the very low timesteps are skipped anyway. """
 		t = jax.random.randint(
 				next(rng), shape=(x.shape[0],), minval=self.tmin, maxval=num_steps)
 		#alpha = self.alpha_set[t]
