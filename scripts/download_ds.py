@@ -58,7 +58,7 @@ if __name__ == '__main__':
                 min_image_size=args.min_image_size,
                 number_sample_per_shard=10000,
                 distributor="multiprocessing",
-                disallowed_header_directives=["noai", "noindex"],
+                disallowed_header_directives=["noai", "noimageai", "noindex", "noimageindex"],
                 resize_mode=args.resize_mode,
                 max_aspect_ratio=float(args.max_aspect_ratio)
             )

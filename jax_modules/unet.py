@@ -146,30 +146,57 @@ class ResnetBlock(nn.Module):
 
 
 class SequenceProcessor(nn.Module):
-    seq_width: Optional[int] = 1024
-    t5_mult: float = 4.0
-    @nn.compact
-    def __call__(self, context):
-        """
-        does several things:
-        1) applies linear transformation separately to clip_seq and t5_seq. t5_seq has less variance so we multiply it by a constant
-        2) prepends a null embedding to the sequence, similar to https://arxiv.org/pdf/2211.01324.pdf. 
-        3) concatenates the sequences.
-        """
-        clip_seq, t5_seq = context["clip_seq"], context["t5_seq"]
+	seq_width: int
+	t5_mult: float = 4.0
+	aesth_score_range: Tuple[float, float] = (2.0, 9.0) #aesth v2 only goes from ~2 -> ~9
 
-        b, hc, ht5 = clip_seq.shape[0], clip_seq.shape[-1], t5_seq.shape[-1]
-        if self.seq_width is None: 
-            seq_width = hc
-        else:
-            seq_width = self.seq_width
+	@nn.compact
+	def __call__(self, context, drop_values):
+		"""
+		does several things:
+		1) applies linear transformation separately to clip_seq and t5_seq. t5_seq has less variance so we multiply it by a constant
+		2) drops some variables for CFG, either randomly with given probabilities 
+		2) prepends a null embedding to the sequence, similar to https://arxiv.org/pdf/2211.01324.pdf. 
+		4) concatenates the sequences.
 
-        assert hc%seq_width == 0 and ht5%seq_width == 0
-        clip_seq = nn.Dense(seq_width)(clip_seq)
-        t5_seq = nn.Dense(seq_width)(t5_seq * self.t5_mult)
-        
-        null_emb = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
-        return jnp.concatenate([null_emb, clip_seq, t5_seq], axis=1)
+		context: a dictionary containing all the conditioning information.
+		drop_values: a dictionary of {key: zero_or_one} deciding whether to drop information from that key.
+		"""
+
+		b, seq_width = clip_seq.shape[0], self.seq_width
+		assert sorted(context.keys()) == sorted(drop_values.keys())
+		full_seq = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
+
+		if "clip_seq" in context.keys():
+			clip_seq = nn.Dense(seq_width)(context["clip_seq"])
+			clip_seq = clip_seq * jnp.broadcast_to(drop_values["clip_seq"], clip_seq.shape)
+			full_seq =  jnp.concatenate([full_seq, clip_seq], axis=1)
+		
+		if "t5_seq" in context.keys():
+			t5_seq = nn.Dense(seq_width)(context["t5_seq"] * self.t5_mult)
+			t5_seq = t5_seq * jnp.broadcast_to(drop_values["t5_seq"], t5_seq.shape)
+			full_seq = jnp.concatenate([full_seq, t5_seq], axis=1)
+			
+		if "clip_img" in context.keys():
+			clip_img = nn.Dense(seq_width)(context["clip_img"])[:, None, :]
+			assert list(clip_img.shape) == [b, 1, seq_width]
+			clip_img = clip_img * jnp.broadcast_to(drop_values["clip_img"], clip_img.shape)
+			full_seq = jnp.concatenate([full_seq, clip_img], axis=1)
+		
+		if "aesth_score" in context.keys():
+			aesth_score_clipped = (context["aesth_score"] - self.aesth_score_range[0]) / (
+				self.aesth_score_range[1] - self.aesth_score_range[0])
+			
+			aesth_time_emb = get_timestep_embedding(
+				jnp.clip(aesth_score_clipped, 0., 1.),
+				embedding_dim=seq_width, 
+				max_time=1.
+			)
+			aesth_emb = nn.Dense(seq_width)(aesth_time_emb)
+			aesth_emb = aesth_emb * jnp.broadcast_to(drop_values["aesth_emb"], aesth_emb.shape)
+			full_seq = jnp.concatenate([full_seq, aesth_emb], axis=1)
+		
+		return full_seq
 
 
 class UNetTextConditioned(nn.Module):
@@ -226,11 +253,13 @@ class UNetTextConditioned(nn.Module):
 		emb = emb.astype(param_dtype)
 		context = context.astype(param_dtype)
 		
-		hs = [nn.Conv(
-				features=ch, kernel_size=(3, 3), strides=(1, 1), name='conv_in')(x)]
-		pe = timestep_embedding_2d(ch, x.shape[1])
-		assert pe.shape[1:] == hs[0].shape[1:]
-		hs= [hs[0].astype(param_dtype) + pe.astype(param_dtype)]
+		h = nn.Conv(
+				features=ch, kernel_size=(3, 3), strides=(1, 1), name='conv_in')(x)
+		if self.use_pe:
+			pe = timestep_embedding_2d(ch, x.shape[1])
+			assert pe.shape[1:] == h.shape[1:]
+			h += pe.astype(param_dtype)
+		hs = [h]
 
 		def maybe_remat(block, i_level):
 			#dont remat the bottom block because it doesn't use much memory.

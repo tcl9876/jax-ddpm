@@ -20,6 +20,66 @@ flags.DEFINE_string("wandb_run", None, "if you are using wandb to manage experim
 flags.mark_flags_as_required(["config", "global_dir"])
 
 
+def evaluate_model_on_captions(state, trainer, config, captions_path, imsave_path):
+    print(f'evaluating model on captions at {captions_path}')
+    if os.path.isfile("tmpfile.npz"): os.remove("tmpfile.npz")
+    gfile.copy(captions_path, "tmpfile.npz")
+    captions_arr = np.load("tmpfile.npz")
+    
+    clip_emb = captions_arr['clip_emb']
+    t5_emb = captions_arr['t5_emb']
+    context = {
+        "clip_emb": flax.jax_utils.replicate(clip_emb, jax.local_devices()),
+        "t5_emb": flax.jax_utils.replicate(t5_emb, jax.local_devices())
+    }
+
+    noise_schedule = config.model.eval_alpha_schedule
+    scheduler = diffusers.FlaxDDIMScheduler(beta_schedule="linear", 
+        beta_start=noise_schedule.beta_start, beta_end=noise_schedule.beta_end)
+    scheduler_state = scheduler.create_state()
+    scheduler_state = flax.jax_utils.replicate(scheduler_state, jax.local_devices())
+    global_rng = jax.random.PRNGKey(0)
+    global_rng, *rng = jax.random.split(global_rng, jax.device_count() + 1)
+    rng = jax.device_put_sharded(rng, jax.devices())
+    
+    params = {
+        "unet": state.params,
+        "scheduler": scheduler_state
+    }
+    pipe = FlaxGeneralDiffusionPipeline(
+        vae=None, 
+        text_encoder=None, 
+        tokenizer=None, 
+        unet=trainer.model,
+        scheduler=scheduler,
+        safety_checker=None,
+        feature_extractor=None,
+        dtype=jax.numpy.float32,
+        model_config=config.model
+    )
+
+    B, H, W, C = t5_emb.shape[0], config.in_dimensions[0],  config.in_dimensions[1], config.model.args.out_ch
+    _, latents = pipe(
+        prompt_ids=context,
+        params=params,
+        prng_seed=rng,
+        num_inference_steps=50,
+        height=H,
+        width=W,
+        guidance_scale=5.,
+        jit=True
+    )
+    latents = np.array(latents.reshape(-1, H, W, C))
+
+    #note: these will have to be decoded by a VAE, in a separate session
+    np.savez("tmpfile.npz", latents=latents)
+    gfile.copy("tmpfile.npz", imsave_path)
+    time.sleep(3.0)
+    gfile.remove("tmpfile.npz")
+    print(f'Successfully saved latents of shape {latents.shape} at {imsave_path}')
+    print(f"Mean {latents.mean()} , Std {latents.std()} , Min {latents.min()} , Max {latents.max()}")
+
+
 
 def main(_):
     config, global_dir = args.config, args.global_dir
@@ -35,6 +95,7 @@ def main(_):
 
     list_devices()
     
+    captions_path = args.captions_path
     use_wandb = (args.wandb_project is not None and args.wandb_run is not None)
     if ismain:
         if use_wandb: 
@@ -51,7 +112,7 @@ def main(_):
             #print and log a dict of kwargs.
             metric_dict = kwargs.pop("metrics")
             if use_wandb:
-                wandb.log(metric_dict)
+                wandb.log(metric_dict.to_dict())
                 wandb.log(kwargs)
             printed_string = ""
             for k, v in kwargs.items():
@@ -83,6 +144,7 @@ def main(_):
     start_step = int(unreplicate(state.step))
     barrier()
 
+
     print(f"Current iteration after restore on node {jax.process_index()}: {start_step}")
     if ismain:
         print("training devices:", devices)
@@ -103,7 +165,8 @@ def main(_):
     global_rng = jax.random.PRNGKey(jax.process_index()) #set seed to process index so different nodes dont receive same rngs
     loss_metric = jax.device_put_replicated(jax.numpy.float32(0.), local_devices)
     gnorm_metric = jax.device_put_replicated(jax.numpy.float32(0.), local_devices)
-
+    
+    print('starting training')
     for global_step in range(start_step, targs.iterations + 1):
         batch = next(train_iter)
         global_rng, *train_step_rng = jax.random.split(global_rng, num=local_device_count + 1)
@@ -136,6 +199,11 @@ def main(_):
             if global_step%save_freq==0 and ismain:
                 state_unrep = state_make_unreplicated(state)
                 save_checkpoint(checkpoint_dir, state_unrep, keep=num_checkpoints, step=state_unrep.step)
+
+        if global_step%targs.snapshot_freq==0 and ismain:
+            imsave_path = os.path.join(os.path.join(global_dir, "results"), f'images_{global_step}.npz')
+            evaluate_model_on_captions(state, trainer, config, captions_path, imsave_path)
+
 
 if __name__ == '__main__':
     app.run(main)

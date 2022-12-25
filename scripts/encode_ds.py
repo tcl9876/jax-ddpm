@@ -2,7 +2,7 @@ import tensorflow as tf
 import jax
 from tensorflow.io import gfile
 import numpy as np
-from transformers import FlaxT5EncoderModel, T5TokenizerFast, FlaxCLIPTextModel, CLIPTokenizerFast
+from transformers import FlaxT5EncoderModel, T5TokenizerFast, FlaxCLIPTextModel, CLIPTokenizerFast, FlaxCLIPVisionModel, CLIPProcessor
 from diffusers import FlaxStableDiffusionPipeline
 import gc
 import jax.numpy as jnp
@@ -62,17 +62,23 @@ def main(_):
     clip_text_params = jax.device_put_replicated(clip_text_params, jax.local_devices())
     clip_tokenizer = CLIPTokenizerFast.from_pretrained(args.config.model.clip_model_id)
 
+    clip_vision_model = FlaxCLIPVisionModel.from_pretrained(args.config.model.clip_model_id, from_pt=True, dtype=jnp.bfloat16)
+    clip_vision_module, clip_vision_params = clip_vision_model.module, clip_vision_model.params
+    clip_vision_params = to_bf16(clip_vision_params)
+    clip_vision_params = jax.device_put_replicated(clip_vision_params, jax.local_devices())
+    clip_vision_processor = CLIPProcessor.from_pretrained(args.config.model.clip_model_id)
+
     with jax.default_device(jax.devices("cpu")[0]):
         t5_model = FlaxT5EncoderModel.from_pretrained(args.config.model.t5_model_id, from_pt=True, dtype=jnp.bfloat16) #bfloat has no effect?
         t5_module, t5_params = t5_model.module, t5_model.params
         t5_params = to_bf16(t5_params)
-
     print("# t5 params:", sum([x.size for x in jax.tree_leaves(t5_params)]))
     t5_params = jax.device_put_replicated(t5_params, jax.local_devices())
-    jax.tree_map(lambda x: print(x.shape, x.dtype), t5_params)
+    #jax.tree_map(lambda x: print(x.shape, x.dtype), t5_params)
     t5_tokenizer = T5TokenizerFast.from_pretrained(args.config.model.t5_model_id, model_max_length=77)
 
-    encoders_fn = make_encoders_fn(vae, clip_text_module, t5_module)
+
+    encoders_fn = make_encoders_fn(vae, clip_vision_module, clip_text_module, t5_module)
     encoders_fn = jax.pmap(encoders_fn) #jax.pmap(lambda a,b,c,d,e,f: (None, None, None)) #
 
     if args.image_format == 'tfrecord':
@@ -94,11 +100,14 @@ def main(_):
 
     TFRECORD_MIN_EXAMPLES = 5000
     
-    all_images, all_clip_embs, all_t5_embs = [], [], []
+    all_images, all_clip_image_embs, all_clip_embs, all_t5_embs = [], [], [], []
 
     num_records = 0
     for image_pixels, captions in full_image_dataset:
         captions = [c.decode('utf-8') for c in captions]
+        image_pixels_T = image_pixels.transpose(0, 3, 1, 2)
+        #print(image_pixels.shape, image_pixels_T.shape, image_pixels.dtype)
+        clip_image_inputs = dict(clip_vision_processor(images=list(image_pixels_T), return_tensors="np"))
         clip_inputs = dict(clip_tokenizer(captions, truncation=True, return_tensors="np", max_length=77, padding='max_length'))
         t5_inputs = dict(t5_tokenizer(captions, truncation=True, return_tensors="np", padding='max_length'))
 
@@ -112,12 +121,17 @@ def main(_):
         else:
             vae_params, processed_images = None, None
 
+        clip_image_inputs = jax.tree_map(reshaper, clip_image_inputs)
         clip_inputs = jax.tree_map(reshaper, clip_inputs)
         t5_inputs = jax.tree_map(reshaper, t5_inputs)
 
-        images, clip_emb, t5_emb = encoders_fn(processed_images, clip_inputs, t5_inputs, vae_params, clip_text_params, t5_params)
+        #print(processed_images.shape, clip_image_inputs.shape, clip_inputs.shape, t5_inputs.shape)
+        #print(type(processed_images), type(clip_image_inputs), type(clip_inputs), type(t5_inputs))
+        clip_image_inputs['pixel_values'] = jnp.transpose(clip_image_inputs['pixel_values'], (0, 1, 3, 4, 2)) #should it be channels last?
+        
+        images, clip_image_emb, clip_emb, t5_emb = encoders_fn(processed_images, clip_image_inputs, clip_inputs, t5_inputs, vae_params, clip_vision_params, clip_text_params, t5_params)
         undo_reshape = lambda x: np.array(x.reshape(-1, *x.shape[2:]))
-        clip_emb, t5_emb = undo_reshape(clip_emb), undo_reshape(t5_emb)
+        clip_image_emb, clip_emb, t5_emb = undo_reshape(clip_image_emb), undo_reshape(clip_emb), undo_reshape(t5_emb)
         clip_mask, t5_mask = undo_reshape(clip_inputs["attention_mask"]), undo_reshape(t5_inputs["attention_mask"])
         if use_vae:
             images = np.transpose(undo_reshape(images), [0, 2, 3, 1])
@@ -125,10 +139,14 @@ def main(_):
             images = image_pixels
 
         images = list(images)
+        #clip_image_emb = list(clip_image_emb)
+        if num_records == 0: print('CLIP SHAPE', len(clip_image_emb), clip_image_emb[0].shape, 'also delete this line')
         for i in range(len(images)):
             images[i] = np.transpose(images[i], [2, 0, 1])
             assert list(images[i].shape) == list(args.config.in_dimensions), images[i].shape
             all_images.append(images[i])
+            all_clip_image_embs.append(clip_image_emb[i])
+
             clip_maskeds, t5_maskeds = np.where(clip_mask[i] == 0)[0], np.where(t5_mask[i] == 0)[0]
             if len(clip_maskeds) == 0:
                 all_clip_embs.append(clip_emb[i])
@@ -155,12 +173,13 @@ def main(_):
                         'image': tofeature(all_images[i]), 
                         'clip_emb': tofeature(all_clip_embs[i]), 
                         't5_emb': tofeature(all_t5_embs[i]),
+                        'clip_image_emb': tofeature(all_clip_image_embs[i])
                     }
                     example_proto = tf.train.Example(features=tf.train.Features(feature=features_for_example))
                     file_writer.write(example_proto.SerializeToString())
 
             printl(f"wrote tfrecord file to {example_path} on node {jax.process_index()}, all images had len {len(all_images)}")
-            all_images, all_clip_embs, all_t5_embs = [], [], []
+            all_images, all_clip_image_embs, all_clip_embs, all_t5_embs = [], [], [], []
             num_records += 1
 
     

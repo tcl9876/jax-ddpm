@@ -80,6 +80,7 @@ def get_config():
             enable_update_skip=False,
             # logging
             log_loss_every_steps=500,
+            snapshot_freq=5000,
             log_dir="{}/logs",
             #checkpoint_every_secs=900,  # 15 minutes
             #eval_every_steps=10000,

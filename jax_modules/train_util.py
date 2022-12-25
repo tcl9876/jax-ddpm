@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#THIS CODE FILE WAS MODIFIED
-
 """Diffusion model training and distillation."""
 
 # pylint: disable=g-long-lambda,g-complex-comprehension,g-long-ternary
@@ -35,29 +33,6 @@ import jax.numpy as jnp
 import optax
 from flax.jax_utils import replicate, unreplicate
 
-#are all the nones needed? todo for later
-@jax.jit
-def replace_params(state, new_params):
-	state = state.replace(params=None)
-	return state.replace(
-		step=state.step + 1,
-		params=new_params
-	)
-
-@jax.jit
-def replace_sharded_params(state, new_sharded_params):
-	state = state.replace(sharded_params=None)
-	return state.replace(sharded_params=new_sharded_params)
-
-@jax.jit
-def replace_ema_params(state, new_ema_params):
-	state = state.replace(ema_params=None)
-	return state.replace(ema_params=new_ema_params)
-
-@jax.jit
-def replace_opt(state, new_opt_state):
-	state = state.replace(optimizer_state=None)
-	return state.replace(optimizer_state=new_opt_state)
 
 #TPU's pad if ch<128, this becomes a problem if optimizer states have ch of 512 or 768
 #since its sharded version (that divides by 8) will result in 64 or 96 channels
@@ -86,12 +61,11 @@ def move_from_last_axis(pytree, mul=2):
 
 @flax.struct.dataclass
 class TrainState:
-	step: int #current iteration
-	params: Any #replicated BF16 copy of model parameters
+	step: int
+	params: Any
 	sharded_params: Any #sharded FP32 copy of model parameters
-	optimizer_state: Any #sharded FP32 copy of adam states
-	ema_params: Any #sharded FP32 copy of EMA parameters
-	
+	optimizer_state: Any
+	ema_params: Any
 
 def get_single_pytree_shard(pytree, i, device_count=8):
 	def slicefn(x, i):
@@ -122,9 +96,13 @@ class Trainer:
 			self.dataset = dataset
 		else:
 			raise Exception('dataset must be provided')
+		#self.dataset = getattr(datasets, config.dataset.name)(
+		#	**config.dataset.args)
+
+		self._eval_step = None
 
 		self.model = UNetTextConditioned(**config.model.args)
-		self.local_devices = jax.local_devices()
+		self.devices = jax.local_devices()
 
 	@property
 	def current_num_steps(self):
@@ -147,34 +125,31 @@ class Trainer:
 		logging.info('Number of trainable parameters: {:,}'.format(
 			utils.count_params(init_params)))
 
-		self.local_device_count = len(self.local_devices)
+		self.device_count = len(self.devices)
 		param_shards = []
 		ema_param_shards = []
 		opt_shards = []
 		self.tx = make_adam(self.config)
 
-		for i in range(self.local_device_count):
-			print('p', i)
-			param_shard = get_single_pytree_shard(init_params, i, self.local_device_count)
+		for i in range(self.device_count):
+			param_shard = get_single_pytree_shard(init_params, i, self.device_count)
 			param_shard = move_to_last_axis(param_shard)
 			param_shard = utils.to_fp32(param_shard)
 			param_shards.append(param_shard)
-		sharded_params = jax.device_put_sharded(param_shards, self.local_devices)
+		sharded_params = jax.device_put_sharded(param_shards, self.devices)
 
-		for i in range(self.local_device_count):
-			print('ema p', i)
+		for i in range(self.device_count):
 			ema_param_shards.append(utils.copy_pytree(param_shards[i]))
-		sharded_ema_params = jax.device_put_sharded(ema_param_shards, self.local_devices)
+		sharded_ema_params = jax.device_put_sharded(ema_param_shards, self.devices)
 		del ema_param_shards
 
-		for i in range(self.local_device_count):
-			print('o', i, 'len arr', len(param_shards))
+		for i in range(self.device_count):
 			opt_shards.append(self.tx.init(param_shards.pop(0)))
-		sharded_optimizer_states = jax.device_put_sharded(opt_shards, self.local_devices)
+		sharded_optimizer_states = jax.device_put_sharded(opt_shards, self.devices)
 		del opt_shards
 			
 		init_params = replicate(init_params)
-		#self.update = self.make_update_fn()
+		print('Replicated params & sharded opt states have been placed on devices')
 		return TrainState(
 			step=replicate(0),
 			params=init_params,
@@ -191,16 +166,36 @@ class Trainer:
 		img = batch['image']
 		assert img.dtype == jnp.float32
 		
-		#drop the text sequence by zero-ing it out. jointly drops clip and t5 embeddings.
-		drop_mask = jnp.greater(jax.random.uniform(next(rng), (img.shape[0], 1, 1)), 0.9).astype(jnp.int32)
 		context = {}
-		for key in ["clip_emb", "t5_emb"]:
-			label = batch[key]
-			uncond_label = jnp.zeros_like(label)
-			mask = jnp.broadcast_to(drop_mask, label.shape)
-			label = label*(1-mask) + mask*uncond_label
-			context[key] = label
+		keep_keys = {}
+		
+		"""
+		p > 0.9 nothing
+		p in [0.85, 0.9] clip image only
+		p in [0.8, 0.85] clip image and captions
+		p < 0.8 captions only
+		"""
+		text_and_image_p = jax.random.uniform(next(rng), (img.shape[0], 1, 1))
+		if "clip_seq" in batch:
+			context["clip_seq"] = batch["clip_seq"]
+			keep_keys["clip_seq"] = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
 
+		if "t5_seq" in batch:
+			context["t5_seq"] = batch["t5_seq"]
+			keep_keys["t5_seq"] = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
+		
+		if "clip_img" in batch:
+			context["clip_img"] = batch["clip_img"]
+			keep_keys["clip_img"] = jnp.logical_and(
+				jnp.less(text_and_image_p, 0.9), jnp.greater(text_and_image_p, 0.8)
+			).astype(jnp.float32)
+		
+		#aesth_p > 0.8 include aesthetic; aesth_p is independent of text_and_image_p
+		aesth_p = jax.random.uniform(next(rng), (img.shape[0], 1, 1))
+		if "aesth_score" in batch:
+			context["aesth_score"] = batch["aesth_score"]
+			keep_keys["aesth_score"] = jnp.less(aesth_p, 0.8).astype(jnp.float32)
+		
 		def model_fn(x, alpha):
 			
 			return self.model.apply(
@@ -227,15 +222,11 @@ class Trainer:
 		return loss
 
 	def forward_backward(self, rng, batch, state, local_core_on_chip, loss_metric, gnorm_metric):
-		"""
-		performs the forward and backward pass, but does not update the optimizer state, returning the gradients (and metrics) only.
-		the gradients are casted to FP32 before being averaged across *all* hosts via jax.lax.pmean.
-		"""
 		rng = utils.RngGen(rng)
 
 		# Loss and gradient
 		loss_fn = functools.partial(self.loss_fn, next(rng), True, batch)
-		loss, grad = jax.value_and_grad(loss_fn)(state.params) #state.params is a replicated copy of mostly BF16 model parameters.
+		loss, grad = jax.value_and_grad(loss_fn)(state.params)
 
 		# Average grad across shards after casting to fp32.
 		grad = utils.to_fp32(grad)
@@ -249,20 +240,13 @@ class Trainer:
 		loss_metric += avg_loss
 		gnorm_metric += avg_gnorm
 		        
-		#TODO: grad skipping?
+		#TODO: grad skipping? --> is this necessary if we clip?
 		grad = jax.tree_map(lambda g: reshape_and_transpose(g)[local_core_on_chip], grad)
 		grad = move_to_last_axis(grad)
 		return grad, loss_metric, gnorm_metric
 
 	def update_fn(self, state, grad):
-		"""
-		applies the adam update on a sharded FP32 state, including updating the EMA.
-		it then downcasts and unshards this sharded copy of the parameters.
-		"""
-		flat = lambda tree: jax.tree_util.tree_flatten(tree)[0]
-		g, o, s = flat(grad), flat(state.optimizer_state), flat(state.sharded_params)
-		print("LENGTHS", len(g), len(o), len(s))
-
+		#apply adam update on sharded FP32 state, then downcast and unshard the fp32 model params.
 		updates, new_opt_state = self.tx.update(
 			grad, state.optimizer_state, state.sharded_params
 		)
@@ -278,8 +262,12 @@ class Trainer:
 		casted_new_params = move_from_last_axis(casted_new_params)
 		new_params = unshard_pytree(casted_new_params)
 
-		state = replace_params(state, new_params)
-		state = replace_sharded_params(state, new_sharded_params)
-		state = replace_ema_params(state, new_ema_params)
-		state = replace_opt(state, new_opt_state)
+		state = state.replace(
+			step=state.step + 1,
+			params=new_params,
+			sharded_params=new_sharded_params,
+			ema_params=new_ema_params,
+			optimizer_state=new_opt_state,
+		)
 		return state
+		
