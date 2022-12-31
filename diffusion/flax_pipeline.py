@@ -27,7 +27,6 @@ from PIL import Image
 from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
 
 from diffusion.dpm import DiffusionWrapper, get_alpha_set, predict_eps_from_x
-from diffusion.schedules import get_logsnr_schedule
 from diffusers.models.vae_flax import FlaxAutoencoderKL
 from diffusers.schedulers import FlaxDDIMScheduler, FlaxLMSDiscreteScheduler, FlaxPNDMScheduler
 from diffusers.utils import logging
@@ -170,8 +169,9 @@ class FlaxGeneralDiffusionPipeline: #when inheriting from FlaxDiffusionPipeline,
         else:
             latents_shape = (batch_size, 3, height, width)
 
-        for key in ["clip_emb", "t5_emb"]:
-            context[key] = jnp.concatenate([jnp.zeros_like(context[key]), context[key]], axis=0)
+        for key in ["clip_emb", "t5_emb", "clip_image_emb", "aesth_score"]:
+            if key in context:
+                context[key] = jnp.concatenate([jnp.zeros_like(context[key]), context[key]], axis=0)
 
         if latents is None:
             latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)

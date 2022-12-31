@@ -18,9 +18,6 @@
 # pylint: disable=invalid-name
 
 import functools
-
-from absl import logging
-import flax
 import jax
 import jax.numpy as jnp
 import numpy as onp
@@ -28,13 +25,15 @@ import PIL
 from tensorflow.io import gfile
 import time
 
-def unreplicate(x):
-    return jax.device_get(flax.jax_utils.unreplicate(x))
-
+def print_and_log(*args, logfile_path):
+	print(*args)
+	args = list(args) + ["\n"]
+	for a in args:
+		with gfile.GFile(logfile_path, mode='a') as f:
+			f.write(str(a))
 
 def normalize_data(x):
 	return x / 127.5 - 1.
-
 
 def unnormalize_data(x):
 	return (x + 1.) * 127.5
@@ -54,24 +53,6 @@ def nearest_neighbor_upsample(x, k=2):
 	x = x.reshape(B, H, 1, W, 1, C)
 	x = jnp.broadcast_to(x, (B, H, k, W, k, C))
 	return x.reshape(B, H * k, W * k, C)
-
-
-def space_to_depth(x, k=2):
-	B, H, W, C = x.shape
-	assert H % k == 0 and W % k == 0
-	x = x.reshape((B, H // k, k, W // k, k, C))
-	x = x.transpose((0, 1, 3, 2, 4, 5))
-	x = x.reshape((B, H // k, W // k, k * k * C))
-	return x
-
-
-def depth_to_space(x, k=2):
-	B, h, w, c = x.shape
-	x = x.reshape((B, h, w, k, k, c // (k * k)))
-	x = x.transpose((0, 1, 3, 2, 4, 5))
-	x = x.reshape((B, h * k, w * k, c // (k * k)))
-	return x
-
 
 def np_tile_imgs(imgs, *, pad_pixels=1, pad_val=255, num_col=0):
 	"""NumPy utility: tile a batch of images into a single image.
@@ -127,7 +108,6 @@ def np_tile_imgs(imgs, *, pad_pixels=1, pad_val=255, num_col=0):
 		imgs = imgs[Ellipsis, 0]
 	return imgs
 
-
 def save_tiled_imgs(filename, imgs, pad_pixels=1, pad_val=255, num_col=0):
 	#creates a grid of images and saves them to a file. also returns the created PIL image.
 	imgs_grid = np_tile_imgs(
@@ -147,107 +127,26 @@ def save_tiled_imgs(filename, imgs, pad_pixels=1, pad_val=255, num_col=0):
 
 	return image
 
-
-
-
-@functools.partial(jax.pmap, axis_name='batch')
-def _check_synced(pytree):
-	mins = jax.lax.pmin(pytree, axis_name='batch')
-	equals = jax.tree_map(jnp.array_equal, pytree, mins)
-	return jnp.all(jnp.asarray(jax.tree_leaves(equals)))
-
-
-def assert_synced(pytree):
-	"""Check that `pytree` is the same across all replicas.
-
-	Args:
-		pytree: the pytree to check (should be replicated)
-
-	Raises:
-		RuntimeError: if sync check failed
-	"""
-	equals = _check_synced(pytree)
-	assert equals.shape == (jax.local_device_count(),)
-	equals = all(jax.device_get(equals))  # no unreplicate
-	logging.info('Sync check result: %d', equals)
-	if not equals:
-		raise RuntimeError('Sync check failed!')
-
-
-@functools.partial(jax.pmap, axis_name='batch')
-def _barrier(x):
-	return jax.lax.psum(x, axis_name='batch')
-
-
-def barrier():
-	"""MPI-like barrier."""
-	jax.device_get(_barrier(jnp.ones((jax.local_device_count(),))))
-
-
-def allgather_and_reshape(x, axis_name='batch'):
-	"""Allgather and merge the newly inserted axis w/ the original batch axis."""
-	y = jax.lax.all_gather(x, axis_name=axis_name)
-	assert y.shape[1:] == x.shape
-	return y.reshape(y.shape[0] * x.shape[0], *x.shape[1:])
-
-
-def np_treecat(xs):
-	return jax.tree_map(lambda *zs: onp.concatenate(zs, axis=0), *xs)
-
-
-def dist(fn, accumulate, axis_name='batch'):
-	"""Wrap a function in pmap and device_get(unreplicate(.)) its return value."""
-
-	if accumulate == 'concat':
-		accumulate_fn = functools.partial(
-				allgather_and_reshape, axis_name=axis_name)
-	elif accumulate == 'mean':
-		accumulate_fn = functools.partial(
-				jax.lax.pmean, axis_name=axis_name)
-	elif accumulate == 'none':
-		accumulate_fn = None
-	else:
-		raise NotImplementedError(accumulate)
-
-	@functools.partial(jax.pmap, axis_name=axis_name)
-	def pmapped_fn(*args, **kwargs):
-		out = fn(*args, **kwargs)
-		return out if accumulate_fn is None else jax.tree_map(accumulate_fn, out)
-
-	def wrapper(*args, **kwargs):
-		return jax.device_get(
-				flax.jax_utils.unreplicate(pmapped_fn(*args, **kwargs)))
-
-	return wrapper
-
-
 def tf_to_numpy(tf_batch):
 	"""TF to NumPy, using ._numpy() to avoid copy."""
 	# pylint: disable=protected-access,g-long-lambda
 	return jax.tree_map(lambda x: (x._numpy()
 						if hasattr(x, '_numpy') else x), tf_batch)
 
-
 def numpy_iter(tf_dataset):
 	return map(tf_to_numpy, iter(tf_dataset))
-
 
 def sumflat(x):
 	return x.sum(axis=tuple(range(1, len(x.shape))))
 
-
 def meanflat(x):
 	return x.mean(axis=tuple(range(1, len(x.shape))))
-
 
 def flatten(x):
 	return x.reshape(x.shape[0], -1)
 
-
-
 def count_params(pytree):
 	return sum([x.size for x in jax.tree_leaves(pytree)])
-
 
 def copy_pytree(pytree):
 	return jax.tree_map(jnp.array, pytree)
@@ -255,11 +154,9 @@ def copy_pytree(pytree):
 def zero_pytree(pytree):
 	return jax.tree_map(jnp.zeros_like, pytree)
 
-
 def global_norm(pytree):
 	return jnp.sqrt(jnp.sum(jnp.asarray(
 			[jnp.sum(jnp.square(x)) for x in jax.tree_leaves(pytree)])))
-
 
 def clip_by_global_norm(pytree, clip_norm, use_norm=None):
 	if use_norm is None:
@@ -268,10 +165,8 @@ def clip_by_global_norm(pytree, clip_norm, use_norm=None):
 	scale = clip_norm * jnp.minimum(1.0 / use_norm, 1.0 / clip_norm)
 	return jax.tree_map(lambda x: x * scale, pytree), use_norm
 
-
 def apply_ema(decay, avg, new):
 	return jax.tree_map(lambda a, b: decay * a + (1. - decay) * b, avg, new)
-
 
 def scale_init(scale, init_fn, dtype=jnp.float32):
 	"""Scale the output of an initializer."""
@@ -281,11 +176,9 @@ def scale_init(scale, init_fn, dtype=jnp.float32):
 
 	return init
 
-
 @functools.partial(jax.jit, static_argnums=(2,))
 def _foldin_and_split(rng, foldin_data, num):
 	return jax.random.split(jax.random.fold_in(rng, foldin_data), num)
-
 
 class RngGen(object):
 	"""Random number generator state utility for Jax."""
@@ -308,28 +201,11 @@ class RngGen(object):
 		self._counter += 1
 		return _foldin_and_split(self._base_rng, self._counter, num)
 
-
 def jax_randint(key, minval=0, maxval=2**20):
 	return int(jax.random.randint(key, shape=(), minval=minval, maxval=maxval))
-
 
 def broadcast_from_left(x, shape):
 	assert len(shape) >= x.ndim
 	return jnp.broadcast_to(
 			x.reshape(x.shape + (1,) * (len(shape) - x.ndim)),
 			shape)
-
-def list_devices(force_no_cpu=True):
-	devices = jax.devices()
-
-	if devices[0].platform == 'cpu' and force_no_cpu:
-		error_msg = \
-		"""Stopping process as Jax couldn't detect TPU/GPU. 
-		If on a TPU, make sure to run pip install "jax[tpu]==0.3.17" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-		If you did that, perhaps try doing 'pkill -9 python && sudo rm -rf /tmp/tpu_logs /tmp/libtpu_lockfile' as per https://github.com/google/jax/issues/10192"""
-		raise RuntimeError(error_msg)
-
-	if jax.process_index() == 0:
-		print("DEVICES: ", devices)
-	
-	print(f"global device count: {len(devices)}, device count on node {jax.process_index()}: {jax.local_device_count}")

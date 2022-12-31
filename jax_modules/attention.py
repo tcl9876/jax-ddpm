@@ -1,3 +1,6 @@
+# This file contains code adapted from both Huggingface Transformers, and Google research's memory_efficient_attention: https://github.com/google-research/google-research/tree/master/memory_efficient_attention
+# Both were licensed under apache 2, lines 38-103 were from google research, lines 104 and after from huggingface.
+# Copyright 2022 The Google Research Authors.
 # Copyright 2022 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +18,9 @@
 import flax.linen as nn
 import jax.numpy as jnp
 import jax
-import numpy as np
-from functools import partial
-from typing import Optional
+from jax import lax
+import math
+import functools
 
 
 def nonlinearity(x):
@@ -31,48 +34,73 @@ class LN32(nn.Module):
 		normx_32 = nn.normalization.LayerNorm(epsilon=1e-5)(x.astype('float32'))
 		return normx_32.astype(x_dtype)
 
-def max_pow2_that_evenly_divides(n):
-    i = 1
-    while n%2 ==0:
-        i *= 2
-        n = n//2
-    return i
+#use bfloat and lax.Precision.DEFAULT, as well as add support for batching.
+def _query_chunk_attention(query,
+                            key,
+                            value,
+                            key_chunk_size=512, #the one specified in the paper/code was for much bigger attention matrices, so we made it smaller.
+                            precision=lax.Precision.DEFAULT,
+                            dtype=jnp.bfloat16):
+    batch_size, num_kv, num_heads, k_features = key.shape
+    v_features = value.shape[-1]
+    key_chunk_size = min(key_chunk_size, num_kv)
+    query = query / jnp.sqrt(k_features).astype(dtype)
 
-def scaled_dp_attention(q, k, v, scale):
-    attention_scores = jnp.einsum("b i d, b j d->b i j", q, k)
-    attention_scores = attention_scores * scale
-    attention_probs = jax.nn.softmax(attention_scores, axis=2)
-    return jnp.einsum("b i j, b j d -> b i d", attention_probs, v)
-
-def att_with_carry(carry, args, scale): #make compatible with jax.lax.scan
-    return None, scaled_dp_attention(*args, scale)
-
-def scan_att(q, k, v, scale, n_splits): 
-    assert q.shape[0]%n_splits == 0
-    nq, nk, nv = [jnp.reshape(h, (n_splits, h.shape[0]//n_splits, h.shape[-2], h.shape[-1])) for h in [q, k, v]]
-    scanfn = partial(att_with_carry, scale=scale)
-    outs = jax.lax.scan(scanfn, None, [nq, nk, nv])[1]
-    return outs.reshape(-1, outs.shape[-2], outs.shape[-1])
-
-"""
-a self attention that limits memory usage dynamically by looking at the sizes of q and k. it is exactly equivalent to scaled_dp_attention.
-by default, dont store more than ~= a single 8-headed 32^2 SA matrix.
-"""
-def lowmem_dot_product_attention(q, k, v, scale, max_allowable=(1024 * 1024 * 8)):
-    #SHAPE: (batch_size * head_size, seq_len, dim // head_size)
-
-    dimprod = q.shape[0] * q.shape[1] * k.shape[1] #full memory cost of SA matrix all heads.
-    true_divisor = dimprod/max_allowable
-    if true_divisor < 1:
-        n_splits = 1 #dont break it down at all, because batching it more is faster.
-    elif true_divisor >= q.shape[0]:
-        n_splits = q.shape[0] #break up q so it has shape [1, ...] , the most possible you can break it down.
-    else:
-        nearest_pow2 = 2 ** np.round(np.log2(true_divisor))
-        max_pow2 = max_pow2_that_evenly_divides(q.shape[0])
-        n_splits = int(min(max_pow2, nearest_pow2))
+    @functools.partial(jax.checkpoint, prevent_cse=False)
+    def summarize_chunk(query, key, value):
+        attn_weights = jnp.einsum(
+            '...qhd,...khd->...qhk', query, key, precision=precision).astype(dtype)
+        max_score = jnp.max(attn_weights, axis=-1, keepdims=True)
+        max_score = jax.lax.stop_gradient(max_score)
+        exp_weights = jnp.exp(attn_weights - max_score)
+        exp_values = jnp.einsum(
+            '...vhf,...qhv->...qhf', value, exp_weights, precision=precision).astype(dtype)
+        max_score = jnp.einsum('...qhk->...qh', max_score)
+        return (exp_values, exp_weights.sum(axis=-1), max_score)
     
-    return scan_att(q, k, v, scale, n_splits)
+    def chunk_scanner(chunk_idx):
+        key_chunk = lax.dynamic_slice(
+            key, (0, chunk_idx, 0, 0),
+            slice_sizes=(batch_size, key_chunk_size, num_heads, k_features))
+        value_chunk = lax.dynamic_slice(
+            value, (0, chunk_idx, 0, 0),
+            slice_sizes=(batch_size, key_chunk_size, num_heads, v_features))
+        return summarize_chunk(query, key_chunk, value_chunk)
+
+    chunk_values, chunk_weights, chunk_max = lax.map(
+        chunk_scanner, xs=jnp.arange(0, num_kv, key_chunk_size))
+
+    global_max = jnp.max(chunk_max, axis=0, keepdims=True)
+    max_diffs = jnp.exp(chunk_max - global_max)
+    chunk_values *= jnp.expand_dims(max_diffs, axis=-1)
+    chunk_weights *= max_diffs
+
+    all_values = chunk_values.sum(axis=0)
+    all_weights = jnp.expand_dims(chunk_weights, -1).sum(axis=0)
+    return all_values / all_weights
+
+def mefficient_attention(query,
+                        key,
+                        value,
+                        query_chunk_size=1024,
+                        precision=jax.lax.Precision.DEFAULT,
+                        dtype=jnp.bfloat16):
+    batch_size, num_q, num_heads, q_features = query.shape
+
+    def chunk_scanner(chunk_idx, _):
+        query_chunk = lax.dynamic_slice(
+            query, (0, chunk_idx, 0, 0),
+            slice_sizes=(batch_size, min(query_chunk_size, num_q), num_heads, q_features))
+        return (chunk_idx + query_chunk_size,
+                _query_chunk_attention(
+                    query_chunk, key, value, precision=precision, dtype=dtype))
+
+    _, res = lax.scan(
+        chunk_scanner,
+        init=0,
+        xs=None,
+        length=math.ceil(num_q / query_chunk_size))
+    return jnp.concatenate(res, axis=0)
 
         
 class FlaxAttentionBlock(nn.Module):
@@ -110,16 +138,12 @@ class FlaxAttentionBlock(nn.Module):
         batch_size, seq_len, dim = tensor.shape
         head_size = self.heads
         tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
-        tensor = jnp.transpose(tensor, (0, 2, 1, 3))
-        tensor = tensor.reshape(batch_size * head_size, seq_len, dim // head_size)
         return tensor
 
     def reshape_batch_dim_to_heads(self, tensor):
-        batch_size, seq_len, dim = tensor.shape
+        batch_size, seq_len, head_size, head_dim = tensor.shape
         head_size = self.heads
-        tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
-        tensor = jnp.transpose(tensor, (0, 2, 1, 3))
-        tensor = tensor.reshape(batch_size // head_size, seq_len, dim * head_size)
+        tensor = tensor.reshape(batch_size, seq_len, head_dim * head_size)
         return tensor
 
     def __call__(self, hidden_states, context=None, deterministic=True):
@@ -132,7 +156,7 @@ class FlaxAttentionBlock(nn.Module):
         key_states = self.reshape_heads_to_batch_dim(key_proj)
         value_states = self.reshape_heads_to_batch_dim(value_proj)
 
-        hidden_states = lowmem_dot_product_attention(query_states, key_states, value_states, self.scale)
+        hidden_states = mefficient_attention(query_states, key_states, value_states)
 
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         hidden_states = self.proj_attn(hidden_states)

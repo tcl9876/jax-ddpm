@@ -20,7 +20,6 @@
 
 from typing import Tuple, Optional, Any
 
-from absl import logging
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
@@ -73,6 +72,7 @@ def get_timestep_embedding(timesteps, embedding_dim,
 2d positional embedding like ViT. adapted from https://github.com/ericl122333/PatchDiffusion-Pytorch/blob/main/patch_diffusion/nn.py
 a model that's given absolute positions might be better at spatial relationships, eg for prompts like 'a red cube *on top of* a blue cube'
 positional encoding is injected right after the input conv. 
+#TODO: see about the height != width case, what it should be.
 """
 def timestep_embedding_2d(dim, resolution):
     omega = 64 / resolution   #higher resolutions need longer wavelengths
@@ -147,44 +147,39 @@ class ResnetBlock(nn.Module):
 
 class SequenceProcessor(nn.Module):
 	seq_width: int
-	t5_mult: float = 4.0
-	aesth_score_range: Tuple[float, float] = (2.0, 9.0) #aesth v2 only goes from ~2 -> ~9
+	t5_mult: float
+	aesth_score_range: Tuple[float, float]
 
 	@nn.compact
-	def __call__(self, context, drop_values):
+	def __call__(self, context):
 		"""
 		does several things:
-		1) applies linear transformation separately to clip_seq and t5_seq. t5_seq has less variance so we multiply it by a constant
-		2) drops some variables for CFG, either randomly with given probabilities 
+		1) applies linear transformation separately to clip_emb, t5_emb, clip_image_emb, aesth_score. t5_emb has less variance so we multiply it by a constant
 		2) prepends a null embedding to the sequence, similar to https://arxiv.org/pdf/2211.01324.pdf. 
-		4) concatenates the sequences.
+		3) concatenates the sequences.
 
 		context: a dictionary containing all the conditioning information.
-		drop_values: a dictionary of {key: zero_or_one} deciding whether to drop information from that key.
 		"""
 
-		b, seq_width = clip_seq.shape[0], self.seq_width
-		assert sorted(context.keys()) == sorted(drop_values.keys())
+		b, seq_width = context[list(context.keys())[0]].shape[0], self.seq_width
 		full_seq = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
 
-		if "clip_seq" in context.keys():
-			clip_seq = nn.Dense(seq_width)(context["clip_seq"])
-			clip_seq = clip_seq * jnp.broadcast_to(drop_values["clip_seq"], clip_seq.shape)
-			full_seq =  jnp.concatenate([full_seq, clip_seq], axis=1)
+		if "clip_emb" in context.keys():
+			clip_emb = nn.Dense(seq_width)(context["clip_emb"])
+			full_seq =  jnp.concatenate([full_seq, clip_emb], axis=1)
 		
-		if "t5_seq" in context.keys():
-			t5_seq = nn.Dense(seq_width)(context["t5_seq"] * self.t5_mult)
-			t5_seq = t5_seq * jnp.broadcast_to(drop_values["t5_seq"], t5_seq.shape)
-			full_seq = jnp.concatenate([full_seq, t5_seq], axis=1)
+		if "t5_emb" in context.keys():
+			t5_emb = nn.Dense(seq_width)(context["t5_emb"] * self.t5_mult)
+			full_seq = jnp.concatenate([full_seq, t5_emb], axis=1)
 			
-		if "clip_img" in context.keys():
-			clip_img = nn.Dense(seq_width)(context["clip_img"])[:, None, :]
-			assert list(clip_img.shape) == [b, 1, seq_width]
-			clip_img = clip_img * jnp.broadcast_to(drop_values["clip_img"], clip_img.shape)
-			full_seq = jnp.concatenate([full_seq, clip_img], axis=1)
+		if "clip_image_emb" in context.keys():
+			clip_image_emb = nn.Dense(seq_width)(context["clip_image_emb"])[:, None, :]
+			assert list(clip_image_emb.shape) == [b, 1, seq_width]
+			full_seq = jnp.concatenate([full_seq, clip_image_emb], axis=1)
 		
 		if "aesth_score" in context.keys():
-			aesth_score_clipped = (context["aesth_score"] - self.aesth_score_range[0]) / (
+			aesth_score = context["aesth_score"]
+			aesth_score_clipped = (aesth_score - self.aesth_score_range[0]) / (
 				self.aesth_score_range[1] - self.aesth_score_range[0])
 			
 			aesth_time_emb = get_timestep_embedding(
@@ -192,8 +187,9 @@ class SequenceProcessor(nn.Module):
 				embedding_dim=seq_width, 
 				max_time=1.
 			)
-			aesth_emb = nn.Dense(seq_width)(aesth_time_emb)
-			aesth_emb = aesth_emb * jnp.broadcast_to(drop_values["aesth_emb"], aesth_emb.shape)
+			aesth_emb = nn.Dense(seq_width)(aesth_time_emb)[:, None, :]
+			keep_aesth = 1. - (aesth_score == jnp.zeros_like(aesth_score)).astype('float32') #if the ORIGINAL aesthetic score was 0, that means it was dropped
+			aesth_emb = aesth_emb * jnp.broadcast_to(keep_aesth[:, None, None], aesth_emb.shape)
 			full_seq = jnp.concatenate([full_seq, aesth_emb], axis=1)
 		
 		return full_seq
@@ -208,20 +204,21 @@ class UNetTextConditioned(nn.Module):
 	ch_mult: Tuple[int]
 	num_res_blocks: int
 	attn_resolutions: Tuple[int]
-	num_heads: Optional[int]
 	dropout: float
+	head_dim: int
+	seq_width: bool
 	
 	logsnr_scale_range: Tuple[float, float] = (-10., 10.)
-
+	aesth_score_range: Tuple[float, float] = (2.0, 9.0) #aesth v2 only goes from ~2 -> ~9
 	resblock_resample: bool = False
-	head_dim: Optional[int] = None  # alternative to num_heads
 	param_dtype: Any = 'fp32'
 	use_glu: bool = False
+	use_pos_enc: bool = True
 	t5_mult: float = 4.0
 
 	@nn.compact
 	def __call__(self, x, alpha, context, *, train):
-		text_processor = SequenceProcessor(seq_width=self.seq_width, t5_mult=self.t5_mult)
+		text_processor = SequenceProcessor(seq_width=self.seq_width, t5_mult=self.t5_mult, aesth_score_range=self.aesth_score_range)
 		context = text_processor(context)
 		
 		B, H, W, _ = x.shape  # pylint: disable=invalid-name
@@ -232,11 +229,9 @@ class UNetTextConditioned(nn.Module):
 		ch = self.ch
 		emb_ch = self.emb_ch
 
-
 		logsnr = jnp.log(alpha / (1 - alpha))
 		logsnr_input = (logsnr - self.logsnr_scale_range[0]) / (
 			self.logsnr_scale_range[1] - self.logsnr_scale_range[0])
-
 
 		if self.param_dtype == 'fp32':
 			param_dtype = jnp.float32
@@ -255,7 +250,7 @@ class UNetTextConditioned(nn.Module):
 		
 		h = nn.Conv(
 				features=ch, kernel_size=(3, 3), strides=(1, 1), name='conv_in')(x)
-		if self.use_pe:
+		if self.use_pos_enc:
 			pe = timestep_embedding_2d(ch, x.shape[1])
 			assert pe.shape[1:] == h.shape[1:]
 			h += pe.astype(param_dtype)

@@ -25,11 +25,10 @@ def get_config():
     return D(
         seed=0,
         dataset=D(
-            name='encoded_t2i', #doesnt matter what the dataset itself is made of, eg laion, coco, cc3m are all ok
             args=D(
-                class_conditional=False,
-                randflip=False,
-                image_size=32
+                image_size=256,
+                resize_method='random_crop',
+                image_format='jpg'
             ),
         ),
         sampler='ddim',
@@ -38,10 +37,10 @@ def get_config():
             # architecture
             name='unet_iddpm',
             args=D(
-                ch=256,
-                emb_ch=512,  # default is ch * 4
-                ch_mult=[1, 1, 2, 2],
-                num_res_blocks=2,
+                ch=128,
+                emb_ch=384,  # default is ch * 4
+                ch_mult=[1, 2, 3, 3],
+                num_res_blocks=3,
                 attn_resolutions=[16, 8, 4],
                 head_dim=128,
                 dropout=0.0,
@@ -50,6 +49,10 @@ def get_config():
                 out_ch=4,
                 seq_width=1024,
                 param_dtype='bf16',
+                t5_mult=4.0,
+                aesth_score_range=(2.0, 9.0),
+                use_glu=False,
+                use_pos_enc=True
             ),
             mean_type='v', # eps, x, both, v
             logvar_type='fixed_large',
@@ -61,30 +64,28 @@ def get_config():
             eval_alpha_schedule=D(name='linear', beta_start=0.00085, beta_end=0.012, steps=1000),
             tmin=5,
             eval_clip_denoised=False,
-            t5_model_id="t5-3b",
+            t5_model_id="t5-large",
             clip_model_id="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
             vae_id="CompVis/stable-diffusion-v1-4"
         ),
         train=D(
             # optimizer
-            batch_size=512,
+            batch_size=256, #the PER-NODE batch size, NOT the global batch size across all nodes. if youre desired total batch size is N, set batch_size=(N//num_nodes)
             optimizer='adam',
-            adam_beta2=0.999,
-            learning_rate=1.2e-4,
+            adam_beta2=0.99,
+            max_learning_rate=1e-4,
+            min_learning_rate=5e-5,
             learning_rate_warmup_steps=5000,
-            weight_decay=0.,
+            weight_decay=0.01,
             ema_decay=0.9999,
             grad_clip=1.0,
             enable_update_skip=False,
-            # logging
             log_loss_every_steps=500,
+            snapshot_freq=5000,
             log_dir="{}/logs",
-            #checkpoint_every_secs=900,  # 15 minutes
-            #eval_every_steps=10000,
             checkpoint_dirs=["{}/checkpoints_recent", "{}/checkpoints_permanent"],  
             num_checkpoints=[10, 999999],
             save_freq=[10000, 100000],
-            iterations=100001
-
+            iterations=1000001
         ),
     )

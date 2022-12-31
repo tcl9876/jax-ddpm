@@ -5,10 +5,18 @@ from absl import app, flags
 from ml_collections.config_flags import config_flags
 from jax_modules.train_util import Trainer
 from jax_modules.checkpoints import save_checkpoint, restore_checkpoint, state_make_unreplicated
-from jax_modules.utils import unreplicate, barrier, list_devices
+from jax_modules.dist_util import unreplicate, barrier, list_devices, assert_synced
+from jax_modules.utils import print_and_log
 from tensorflow.io import gfile, write_file
 from t2i_datasets.utils import read_encoded, build_tfrecord_dataset
 from argparse import Namespace
+import numpy as np
+import jax.numpy as jnp
+import flax
+import diffusers
+from diffusion.flax_pipeline import FlaxGeneralDiffusionPipeline
+from functools import partial
+
 
 args = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "the location of the config path you will use to train the model. e.g. ./config/cifar10.py")
@@ -17,20 +25,24 @@ flags.DEFINE_string("data_dir", None, "the directory where your data is stored (
 flags.DEFINE_string("sampling_probs", None, "if data_dir is a comma separated list of image directories, the respective probabilities to sample from each (also as comma separated list)")
 flags.DEFINE_string("wandb_project", None, "if you are using wandb to manage experiments, the project name.")
 flags.DEFINE_string("wandb_run", None, "if you are using wandb to manage experiments, the experiment run name.")
+flags.DEFINE_string("captions_path", None, "if you are evaluating during training, the path for the npz array that contains text embeddings of the desired captions.")
 flags.mark_flags_as_required(["config", "global_dir"])
 
 
-def evaluate_model_on_captions(state, trainer, config, captions_path, imsave_path):
+def evaluate_model_on_captions(state, trainer, config, captions_path, imsave_path, default_aesth_score=6.5, clip_image_emb=None):
     print(f'evaluating model on captions at {captions_path}')
     if os.path.isfile("tmpfile.npz"): os.remove("tmpfile.npz")
     gfile.copy(captions_path, "tmpfile.npz")
     captions_arr = np.load("tmpfile.npz")
     
-    clip_emb = captions_arr['clip_emb']
-    t5_emb = captions_arr['t5_emb']
+    if clip_image_emb is None:
+        clip_image_emb = jnp.zeros((captions_arr['clip_emb'].shape[0], captions_arr['clip_emb'].shape[-1]))
+    default_aesth_score = jnp.ones((captions_arr['clip_emb'].shape[0], )) * default_aesth_score
     context = {
-        "clip_emb": flax.jax_utils.replicate(clip_emb, jax.local_devices()),
-        "t5_emb": flax.jax_utils.replicate(t5_emb, jax.local_devices())
+        "clip_emb": flax.jax_utils.replicate(captions_arr['clip_emb'], jax.local_devices()),
+        "t5_emb": flax.jax_utils.replicate(captions_arr['t5_emb'], jax.local_devices()),
+        "clip_image_emb": flax.jax_utils.replicate(clip_image_emb, jax.local_devices()),
+        "aesth_score": flax.jax_utils.replicate(default_aesth_score, jax.local_devices())
     }
 
     noise_schedule = config.model.eval_alpha_schedule
@@ -58,7 +70,7 @@ def evaluate_model_on_captions(state, trainer, config, captions_path, imsave_pat
         model_config=config.model
     )
 
-    B, H, W, C = t5_emb.shape[0], config.in_dimensions[0],  config.in_dimensions[1], config.model.args.out_ch
+    B, H, W, C = captions_arr['clip_emb'].shape[0], config.in_dimensions[0],  config.in_dimensions[1], config.model.args.out_ch
     _, latents = pipe(
         prompt_ids=context,
         params=params,
@@ -137,6 +149,7 @@ def main(_):
     trainer = Trainer(config, dataset=dataset_info_obj)
     state = trainer.make_init_state()
     state = restore_checkpoint(targs.checkpoint_dirs[0], state, make_replicated=True)
+    assert_synced(state.params)
 
     devices = jax.devices()
     local_devices = jax.local_devices()
@@ -150,11 +163,12 @@ def main(_):
         print("training devices:", devices)
         print("device count:", len(devices))
 
-    fb_step = jax.pmap(trainer.forward_backward, axis_name='batch', devices=devices) #fb_step will all-reduce grads over all nodes, so devices includes all devices
-    update_func = jax.pmap(trainer.update_fn, axis_name='i', devices=local_devices) #the state update is run independently on each node, so devices only include local devices
-
+    fb_step = jax.pmap(trainer.forward_backward, axis_name='all_devices', devices=devices) #fb_step will all-reduce grads over all nodes, so devices includes all devices
+    update_func = jax.pmap(trainer.update_fn, axis_name='local_devices', devices=local_devices) #the state update is run independently on each node, so devices only include local devices
+    
+    printl = partial(print_and_log, logfile_path=logfile_path)
     train_iter = build_tfrecord_dataset(args.data_dir, batch_sizes=[targs.batch_size//jax.local_device_count(), jax.local_device_count()],
-        map_fn=read_encoded, process_index=jax.process_index(), process_count=jax.process_count(), repeating=True, sampling_probs=args.sampling_probs)
+        map_fn=read_encoded, process_index=jax.process_index(), process_count=jax.process_count(), repeating=True, sampling_probs=args.sampling_probs, print_func=printl)
 
     s = time.time()
     if ismain:
@@ -197,12 +211,14 @@ def main(_):
         
         for checkpoint_dir, num_checkpoints, save_freq in zip(targs.checkpoint_dirs, targs.num_checkpoints, targs.save_freq):
             if global_step%save_freq==0 and ismain:
+                assert_synced(state.params)
                 state_unrep = state_make_unreplicated(state)
                 save_checkpoint(checkpoint_dir, state_unrep, keep=num_checkpoints, step=state_unrep.step)
 
         if global_step%targs.snapshot_freq==0 and ismain:
             imsave_path = os.path.join(os.path.join(global_dir, "results"), f'images_{global_step}.npz')
-            evaluate_model_on_captions(state, trainer, config, captions_path, imsave_path)
+            if ismain and args.captions_path is not None:
+                evaluate_model_on_captions(state, trainer, config, captions_path, imsave_path)
 
 
 if __name__ == '__main__':

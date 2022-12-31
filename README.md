@@ -62,8 +62,8 @@ To-do's:
 - [x] work on dataloader for LAION dataset, that might include pre-computed text and/or image embeddings
 - [x] write training script for a text-to-image latent diffusion model
 - [x] support multinode training
-- [ ] allow for evaluator to run inside trainloop
-- [ ] add inpainting and aesthetic score conditioning
+- [x] allow for evaluator to run inside trainloop
+- [x] add aesthetic score conditioning
 - [ ] allow for conversion to pytorch so it can be integrated into diffusers
 
 

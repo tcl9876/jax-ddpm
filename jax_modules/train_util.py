@@ -25,38 +25,27 @@ from typing import Any, Union
 from diffusion.dpm import DiffusionWrapper
 from .unet import UNetTextConditioned
 from . import utils
-from .optimizer import make_adam, unshard_pytree
+from .optimizer import make_adam
 from absl import logging
 import flax
 import jax
 import jax.numpy as jnp
 import optax
 from flax.jax_utils import replicate, unreplicate
+from .dist_util import reshape_and_transpose, get_single_pytree_shard, move_to_last_axis, move_from_last_axis, unshard_pytree
 
 
-#TPU's pad if ch<128, this becomes a problem if optimizer states have ch of 512 or 768
-#since its sharded version (that divides by 8) will result in 64 or 96 channels
-#to avoid padding, we move from the second last to last axis so its divisible by 128 
-def move_to_last_axis(pytree, mul=2):
-	def movefn(x):
-		xshape = x.shape
-		if len(xshape) >= 2 and xshape[-1] * x.shape[-2] > 16384:
-			newshape = list(xshape[:-2]) + [x.shape[-2] //mul, x.shape[-1]*mul]
-			return jnp.reshape(x, newshape)
-		else:
-			return x
-	return jax.tree_map(lambda a: movefn(a), pytree)
-
-def move_from_last_axis(pytree, mul=2):
-	def movefn(x):
-		xshape = x.shape
-		if len(xshape) >= 2 and xshape[-1] * x.shape[-2] > 16384:
-			newshape = list(xshape[:-2]) + [x.shape[-2] *mul, x.shape[-1] //mul]
-			return jnp.reshape(x, newshape)
-		else:
-			return x
-	return jax.tree_map(lambda a: movefn(a), pytree)
-
+CLIP_CHANNELS = {
+	"openai/clip-vit-large-patch14": 768,
+	"laion/CLIP-ViT-H-14-laion2B-s32B-b79K": 1024
+}
+T5_CHANNELS = {
+	"t5-large": 1024,
+	"t5-3b": 1024,
+	"t5-11b": 1024,
+	"google/t5-v1_1-xl": 2048,
+	"google/t5-v1_1-xxl": 4096
+}
 
 
 @flax.struct.dataclass
@@ -66,26 +55,7 @@ class TrainState:
 	sharded_params: Any #sharded FP32 copy of model parameters
 	optimizer_state: Any
 	ema_params: Any
-
-def get_single_pytree_shard(pytree, i, device_count=8):
-	def slicefn(x, i):
-		dim = x.shape[-1] // device_count
-		return x[..., dim*i:dim*i+dim]
-	return jax.tree_map(lambda a: slicefn(a, i), pytree)
-
-#this is working as intended, right? --> maybe test it
-def reshape_and_transpose(x):
-	shapelen = len(x.shape)
-	newshape = list(x.shape[:-1]) + [8, x.shape[-1] // 8]
-	x = jnp.reshape(x, newshape)
 	
-	#hwi8j -> 8hwij,  01234 -> 30124  shapelen 4
-	#8j -> 8j  01 -> 01 shapelen 1
-	#i8j -> 8ij  012 -> 102 shapelen 2
-	newperm = [shapelen-1] + list(range(shapelen-1)) + [shapelen]
-	x = jnp.transpose(x, newperm)
-	return x         
-
 class Trainer:
 	"""Diffusion model."""
 
@@ -96,8 +66,6 @@ class Trainer:
 			self.dataset = dataset
 		else:
 			raise Exception('dataset must be provided')
-		#self.dataset = getattr(datasets, config.dataset.name)(
-		#	**config.dataset.args)
 
 		self._eval_step = None
 
@@ -109,9 +77,15 @@ class Trainer:
 		return self.config.model.train_num_steps
 
 	def make_init_params(self, global_rng):
+		context = dict(
+			clip_emb=jnp.zeros((1, 77, CLIP_CHANNELS[self.config.model.clip_model_id]), dtype=jnp.float32),
+			t5_emb=jnp.zeros((1, 77, T5_CHANNELS[self.config.model.t5_model_id]), dtype=jnp.float32),
+			clip_image_emb=jnp.zeros((1, CLIP_CHANNELS[self.config.model.clip_model_id]), dtype=jnp.float32),
+			aesth_score=jnp.zeros((1,), dtype=jnp.float32)
+		)
 		init_kwargs = dict(
 			x=jnp.zeros((1, *self.dataset.data_shape), dtype=jnp.float32),
-			context={"clip_emb": jnp.zeros((1, 77, 1024), dtype=jnp.float32), "t5_emb": jnp.zeros((1, 77, 1024), dtype=jnp.float32)},
+			context=context,
 			alpha=jnp.ones((1,), dtype=jnp.float32)*0.5,
 			train=False,
 		)
@@ -167,8 +141,6 @@ class Trainer:
 		assert img.dtype == jnp.float32
 		
 		context = {}
-		keep_keys = {}
-		
 		"""
 		p > 0.9 nothing
 		p in [0.85, 0.9] clip image only
@@ -177,24 +149,24 @@ class Trainer:
 		"""
 		text_and_image_p = jax.random.uniform(next(rng), (img.shape[0], 1, 1))
 		if "clip_seq" in batch:
-			context["clip_seq"] = batch["clip_seq"]
-			keep_keys["clip_seq"] = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
+			keep_val = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
+			context["clip_seq"] = batch["clip_seq"] * jnp.broadcast_to(keep_val, batch["clip_seq"].shape)
 
 		if "t5_seq" in batch:
-			context["t5_seq"] = batch["t5_seq"]
-			keep_keys["t5_seq"] = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
+			keep_val = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
+			context["t5_seq"] = batch["t5_seq"] * jnp.broadcast_to(keep_val, batch["t5_seq"].shape)
 		
 		if "clip_img" in batch:
-			context["clip_img"] = batch["clip_img"]
-			keep_keys["clip_img"] = jnp.logical_and(
+			keep_val = jnp.logical_and(
 				jnp.less(text_and_image_p, 0.9), jnp.greater(text_and_image_p, 0.8)
 			).astype(jnp.float32)
+			context["clip_img"] = batch["clip_img"] * jnp.broadcast_to(keep_val, batch["clip_img"].shape)
 		
 		#aesth_p > 0.8 include aesthetic; aesth_p is independent of text_and_image_p
-		aesth_p = jax.random.uniform(next(rng), (img.shape[0], 1, 1))
+		aesth_p = jax.random.uniform(next(rng), (img.shape[0],))
 		if "aesth_score" in batch:
-			context["aesth_score"] = batch["aesth_score"]
-			keep_keys["aesth_score"] = jnp.less(aesth_p, 0.8).astype(jnp.float32)
+			keep_val = jnp.less(aesth_p, 0.8).astype(jnp.float32)
+			context["aesth_score"] = batch["aesth_score"] * jnp.broadcast_to(keep_val, batch["aesth_score"].shape)
 		
 		def model_fn(x, alpha):
 			
@@ -232,11 +204,10 @@ class Trainer:
 		grad = utils.to_fp32(grad)
 		grad, gnorm = utils.clip_by_global_norm(
 			grad, clip_norm=self.config.train.grad_clip)
-		grad = jax.lax.pmean(grad, axis_name='batch')
+		grad = jax.lax.pmean(grad, axis_name='all_devices')
 
-
-		avg_loss = jax.lax.pmean(loss, axis_name='batch')
-		avg_gnorm = jax.lax.pmean(gnorm, axis_name='batch')
+		avg_loss = jax.lax.pmean(loss, axis_name='all_devices')
+		avg_gnorm = jax.lax.pmean(gnorm, axis_name='all_devices')
 		loss_metric += avg_loss
 		gnorm_metric += avg_gnorm
 		        

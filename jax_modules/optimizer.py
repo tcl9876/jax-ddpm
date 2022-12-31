@@ -1,4 +1,3 @@
-import jax
 import optax
 import jax.numpy as jnp
 
@@ -27,7 +26,7 @@ def make_adam(config):
     if config.train.weight_decay > 0.:
         optimizer_kwargs['weight_decay'] = config.train.weight_decay
 
-    learning_rate = CosineDecay(0.0, config.train.learning_rate, config.train.learning_rate, config.train.learning_rate_warmup_steps, config.train.get('decay_steps', config.train.iterations))
+    learning_rate = CosineDecay(0.0, config.train.max_learning_rate, config.train.min_learning_rate, config.train.learning_rate_warmup_steps, config.train.get('decay_steps', config.train.iterations))
     if config.train.optimizer == 'adam':
         optimizer = optax.adamw(
             **optimizer_kwargs,
@@ -38,21 +37,3 @@ def make_adam(config):
         raise NotImplementedError()
 
     return optimizer
-
-
-def shard_pytree(pytree, num_shards=8):
-    def shard_tensor(inputs):
-        assert inputs.shape[-1]%num_shards == 0, f"cannot evenly shard input with last dimension {inputs.shape[-1]} into {num_shards} shards"
-        axis_index = jax.lax.axis_index('i')
-        sharded_shape = list(inputs.shape[:-1]) + [num_shards, inputs.shape[-1]//num_shards] #reshapes a [..., C] tensor to a [..., n, C//n] tensor, allowing for indexing on the last axis.
-        inputs_sharded = inputs.reshape(sharded_shape)
-        return inputs_sharded[..., axis_index, :]
-    return jax.tree_util.tree_map(shard_tensor, pytree)
-
-def unshard_pytree(pytree):
-    def unshard_tensor(inputs):
-        gather_axis = len(inputs.shape) - 1
-        gathered_inputs = jax.lax.all_gather(inputs, axis_name='i', axis=gather_axis)
-        unsharded_shape = list(inputs.shape[:-1]) + [-1] #reshapes a [..., n, C//n] tensor to a [..., C] tensor, which was its original shape
-        return gathered_inputs.reshape(unsharded_shape)
-    return jax.tree_util.tree_map(unshard_tensor, pytree)
