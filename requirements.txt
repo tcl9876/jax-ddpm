@@ -14,3 +14,4 @@ tensorflow_io
 img2dataset
 gcsfs
 opencv-python
+sentencepiece

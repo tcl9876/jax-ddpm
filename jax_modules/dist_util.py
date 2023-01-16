@@ -85,9 +85,9 @@ def get_single_pytree_shard(pytree, i, device_count=8):
 	return jax.tree_map(lambda a: slicefn(a, i), pytree)
 
 #this is working as intended, right? --> maybe test it
-def reshape_and_transpose(x):
+def reshape_and_transpose(x, device_count=8):
 	shapelen = len(x.shape)
-	newshape = list(x.shape[:-1]) + [8, x.shape[-1] // 8]
+	newshape = list(x.shape[:-1]) + [device_count, x.shape[-1] // device_count]
 	x = jnp.reshape(x, newshape)
 	
 	#hwi8j -> 8hwij,  01234 -> 30124  shapelen 4
@@ -104,10 +104,10 @@ def list_devices(force_no_cpu=True):
 		error_msg = \
 		"""Stopping process as Jax couldn't detect TPU/GPU. 
 		If on a TPU, make sure to run pip install "jax[tpu]==0.3.17" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-		If you did that, perhaps try doing 'pkill -9 python && sudo rm -rf /tmp/tpu_logs /tmp/libtpu_lockfile' as per https://github.com/google/jax/issues/10192"""
+		If you did that, perhaps try doing 'pkill -9 python && sudo rm -rf /tmp/tpu_logs /tmp/libtpu_lockfile'"""
 		raise RuntimeError(error_msg)
 
 	if jax.process_index() == 0:
 		print("DEVICES: ", devices)
 	
-	print(f"global device count: {len(devices)}, device count on node {jax.process_index()}: {jax.local_device_count}")
+	print(f"global device count: {len(devices)}, device count on node {jax.process_index()}: {jax.local_device_count()}")

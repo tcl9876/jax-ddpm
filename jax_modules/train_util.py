@@ -70,7 +70,7 @@ class Trainer:
 		self._eval_step = None
 
 		self.model = UNetTextConditioned(**config.model.args)
-		self.devices = jax.local_devices()
+		self.local_devices = jax.local_devices()
 
 	@property
 	def current_num_steps(self):
@@ -81,8 +81,14 @@ class Trainer:
 			clip_emb=jnp.zeros((1, 77, CLIP_CHANNELS[self.config.model.clip_model_id]), dtype=jnp.float32),
 			t5_emb=jnp.zeros((1, 77, T5_CHANNELS[self.config.model.t5_model_id]), dtype=jnp.float32),
 			clip_image_emb=jnp.zeros((1, CLIP_CHANNELS[self.config.model.clip_model_id]), dtype=jnp.float32),
-			aesth_score=jnp.zeros((1,), dtype=jnp.float32)
+			aesth_score=jnp.zeros((1,), dtype=jnp.float32),
+			height=jnp.zeros((1,), dtype=jnp.float32),
+			width=jnp.zeros((1,), dtype=jnp.float32),
+
 		)
+		for key in context:
+			print(context[key].shape)
+			
 		init_kwargs = dict(
 			x=jnp.zeros((1, *self.dataset.data_shape), dtype=jnp.float32),
 			context=context,
@@ -99,27 +105,28 @@ class Trainer:
 		logging.info('Number of trainable parameters: {:,}'.format(
 			utils.count_params(init_params)))
 
-		self.device_count = len(self.devices)
+		self.local_device_count = len(self.local_devices)
 		param_shards = []
 		ema_param_shards = []
 		opt_shards = []
 		self.tx = make_adam(self.config)
 
-		for i in range(self.device_count):
-			param_shard = get_single_pytree_shard(init_params, i, self.device_count)
-			param_shard = move_to_last_axis(param_shard)
+		for i in range(self.local_device_count):
+			param_shard = get_single_pytree_shard(init_params, i, self.local_device_count)
+			mul = 2 if self.local_device_count == 8 else 1 #this only needed for tpu v2 and v3
+			param_shard = move_to_last_axis(param_shard, mul=mul)
 			param_shard = utils.to_fp32(param_shard)
 			param_shards.append(param_shard)
-		sharded_params = jax.device_put_sharded(param_shards, self.devices)
+		sharded_params = jax.device_put_sharded(param_shards, self.local_devices)
 
-		for i in range(self.device_count):
+		for i in range(self.local_device_count):
 			ema_param_shards.append(utils.copy_pytree(param_shards[i]))
-		sharded_ema_params = jax.device_put_sharded(ema_param_shards, self.devices)
+		sharded_ema_params = jax.device_put_sharded(ema_param_shards, self.local_devices)
 		del ema_param_shards
 
-		for i in range(self.device_count):
+		for i in range(self.local_device_count):
 			opt_shards.append(self.tx.init(param_shards.pop(0)))
-		sharded_optimizer_states = jax.device_put_sharded(opt_shards, self.devices)
+		sharded_optimizer_states = jax.device_put_sharded(opt_shards, self.local_devices)
 		del opt_shards
 			
 		init_params = replicate(init_params)
@@ -148,28 +155,28 @@ class Trainer:
 		p < 0.8 captions only
 		"""
 		text_and_image_p = jax.random.uniform(next(rng), (img.shape[0], 1, 1))
-		if "clip_seq" in batch:
+		if "clip_emb" in batch.keys():
 			keep_val = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
-			context["clip_seq"] = batch["clip_seq"] * jnp.broadcast_to(keep_val, batch["clip_seq"].shape)
+			context["clip_emb"] = batch["clip_emb"] * jnp.broadcast_to(keep_val, batch["clip_emb"].shape)
 
-		if "t5_seq" in batch:
+		if "t5_emb" in batch.keys():
 			keep_val = jnp.less(text_and_image_p, 0.85).astype(jnp.float32)
-			context["t5_seq"] = batch["t5_seq"] * jnp.broadcast_to(keep_val, batch["t5_seq"].shape)
+			context["t5_emb"] = batch["t5_emb"] * jnp.broadcast_to(keep_val, batch["t5_emb"].shape)
 		
-		if "clip_img" in batch:
+		if "clip_image_emb" in batch.keys():
 			keep_val = jnp.logical_and(
 				jnp.less(text_and_image_p, 0.9), jnp.greater(text_and_image_p, 0.8)
 			).astype(jnp.float32)
-			context["clip_img"] = batch["clip_img"] * jnp.broadcast_to(keep_val, batch["clip_img"].shape)
+			context["clip_image_emb"] = batch["clip_image_emb"] * jnp.broadcast_to(keep_val[..., 0], batch["clip_image_emb"].shape)
 		
-		#aesth_p > 0.8 include aesthetic; aesth_p is independent of text_and_image_p
-		aesth_p = jax.random.uniform(next(rng), (img.shape[0],))
-		if "aesth_score" in batch:
-			keep_val = jnp.less(aesth_p, 0.8).astype(jnp.float32)
-			context["aesth_score"] = batch["aesth_score"] * jnp.broadcast_to(keep_val, batch["aesth_score"].shape)
-		
-		def model_fn(x, alpha):
+		#aesth_p > 0.8 include aesthetic; aesth_p is independent of text_and_image_p. same for h/w.
+		scalar_keys = [k for k in ["aesth_score", "height", "width"] if k in batch.keys()]
+		for key in scalar_keys:
+			keep_p = jax.random.uniform(next(rng), (img.shape[0],))
+			keep_val = jnp.less(keep_p, 0.8).astype(jnp.float32)
+			context[key] = batch[key] * jnp.broadcast_to(keep_val, batch[key].shape)
 			
+		def model_fn(x, alpha):
 			return self.model.apply(
 				{'params': params}, x=x, alpha=alpha, context=context, train=train,
 				rngs={'dropout': next(rng)} if train else None)
@@ -211,9 +218,9 @@ class Trainer:
 		loss_metric += avg_loss
 		gnorm_metric += avg_gnorm
 		        
-		#TODO: grad skipping? --> is this necessary if we clip?
-		grad = jax.tree_map(lambda g: reshape_and_transpose(g)[local_core_on_chip], grad)
-		grad = move_to_last_axis(grad)
+		grad = jax.tree_map(lambda g: reshape_and_transpose(g, device_count=self.local_device_count)[local_core_on_chip], grad)
+		mul = 2 if self.local_device_count == 8 else 1 #this only needed for tpu v2 and v3
+		grad = move_to_last_axis(grad, mul=mul)
 		return grad, loss_metric, gnorm_metric
 
 	def update_fn(self, state, grad):
@@ -230,7 +237,8 @@ class Trainer:
 			lambda x, y: x.astype(y.dtype),
 			new_sharded_params, state.params
 		)
-		casted_new_params = move_from_last_axis(casted_new_params)
+		mul = 2 if self.local_device_count == 8 else 1 #this only needed for tpu v2 and v3
+		casted_new_params = move_from_last_axis(casted_new_params, mul=mul)
 		new_params = unshard_pytree(casted_new_params)
 
 		state = state.replace(

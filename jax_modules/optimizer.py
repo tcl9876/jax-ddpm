@@ -36,4 +36,6 @@ def make_adam(config):
     else:
         raise NotImplementedError()
 
+    if config.train.enable_update_skip:
+        optimizer = optax.apply_if_finite(optimizer, 100) #any more than 100 NaN's and something is definitely wrong.
     return optimizer

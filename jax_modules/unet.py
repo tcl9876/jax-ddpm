@@ -161,6 +161,7 @@ class SequenceProcessor(nn.Module):
 		context: a dictionary containing all the conditioning information.
 		"""
 
+		print(list(context.keys()))
 		b, seq_width = context[list(context.keys())[0]].shape[0], self.seq_width
 		full_seq = nn.Embed(1, seq_width)(jnp.zeros([b, 1], dtype=jnp.int32))
 
@@ -177,20 +178,24 @@ class SequenceProcessor(nn.Module):
 			assert list(clip_image_emb.shape) == [b, 1, seq_width]
 			full_seq = jnp.concatenate([full_seq, clip_image_emb], axis=1)
 		
-		if "aesth_score" in context.keys():
-			aesth_score = context["aesth_score"]
-			aesth_score_clipped = (aesth_score - self.aesth_score_range[0]) / (
+		scalar_keys = [k for k in ["aesth_score", "height", "width"] if k in context.keys()]
+		for key in scalar_keys:
+			value = jnp.array(context[key]) #copy
+			if key in ["height", "width"]:
+				value = value / 1024. #divides the height by 1024 so its range is less.
+			else:
+				value = (value - self.aesth_score_range[0]) / (
 				self.aesth_score_range[1] - self.aesth_score_range[0])
 			
-			aesth_time_emb = get_timestep_embedding(
-				jnp.clip(aesth_score_clipped, 0., 1.),
+			value_emb = get_timestep_embedding(
+				jnp.clip(context[key], 0., 1.),
 				embedding_dim=seq_width, 
 				max_time=1.
-			)
-			aesth_emb = nn.Dense(seq_width)(aesth_time_emb)[:, None, :]
-			keep_aesth = 1. - (aesth_score == jnp.zeros_like(aesth_score)).astype('float32') #if the ORIGINAL aesthetic score was 0, that means it was dropped
-			aesth_emb = aesth_emb * jnp.broadcast_to(keep_aesth[:, None, None], aesth_emb.shape)
-			full_seq = jnp.concatenate([full_seq, aesth_emb], axis=1)
+			)[:, None, :]
+			value_emb = nn.Dense(seq_width)(value_emb)
+			keep_val = 1. - (context[key] == jnp.zeros_like(context[key])).astype('float32') #if the ORIGINAL aesthetic score was 0, that means it was dropped, so zero out the embedding.
+			value_emb = value_emb * jnp.broadcast_to(keep_val[:, None, None], value_emb.shape)
+			full_seq = jnp.concatenate([full_seq, value_emb], axis=1)
 		
 		return full_seq
 

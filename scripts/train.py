@@ -3,7 +3,7 @@ import time
 import jax
 from absl import app, flags
 from ml_collections.config_flags import config_flags
-from jax_modules.train_util import Trainer
+from jax_modules.train_util import Trainer, T5_CHANNELS, CLIP_CHANNELS
 from jax_modules.checkpoints import save_checkpoint, restore_checkpoint, state_make_unreplicated
 from jax_modules.dist_util import unreplicate, barrier, list_devices, assert_synced
 from jax_modules.utils import print_and_log
@@ -26,6 +26,7 @@ flags.DEFINE_string("sampling_probs", None, "if data_dir is a comma separated li
 flags.DEFINE_string("wandb_project", None, "if you are using wandb to manage experiments, the project name.")
 flags.DEFINE_string("wandb_run", None, "if you are using wandb to manage experiments, the experiment run name.")
 flags.DEFINE_string("captions_path", None, "if you are evaluating during training, the path for the npz array that contains text embeddings of the desired captions.")
+flags.DEFINE_string("start_tfrecord_index", "auto", "starts from the n'th tfrecord file on each node. so if you want to skip the first 10000 files in all, and have 4 nodes, set --start_tfrecord_index 2500")
 flags.mark_flags_as_required(["config", "global_dir"])
 
 
@@ -165,24 +166,41 @@ def main(_):
 
     fb_step = jax.pmap(trainer.forward_backward, axis_name='all_devices', devices=devices) #fb_step will all-reduce grads over all nodes, so devices includes all devices
     update_func = jax.pmap(trainer.update_fn, axis_name='local_devices', devices=local_devices) #the state update is run independently on each node, so devices only include local devices
-    
     printl = partial(print_and_log, logfile_path=logfile_path)
-    train_iter = build_tfrecord_dataset(args.data_dir, batch_sizes=[targs.batch_size//jax.local_device_count(), jax.local_device_count()],
-        map_fn=read_encoded, process_index=jax.process_index(), process_count=jax.process_count(), repeating=True, sampling_probs=args.sampling_probs, print_func=printl)
+
+    if args.start_tfrecord_index.lower() == "auto":
+        steps_per_tfrecord = config.dataset.args.number_encodings_per_shard/targs.batch_size
+        num_tfrecords_passed = int(np.ceil(start_step/steps_per_tfrecord))
+    else:
+        num_tfrecords_passed = int(args.start_tfrecord_index)
+
+    
+    map_fn = partial(read_encoded, remove_keys=config.dataset.args.remove_keys, clip_channels=CLIP_CHANNELS[config.model.clip_model_id], t5_channels=T5_CHANNELS[config.model.t5_model_id])
+    train_iter = build_tfrecord_dataset(args.data_dir, batch_sizes=[targs.batch_size//local_device_count, local_device_count],
+        map_fn=map_fn, process_index=jax.process_index(), process_count=jax.process_count(), repeating=False, num_tfrecords_passed=num_tfrecords_passed,
+        sampling_probs=args.sampling_probs, print_func=printl)
 
     s = time.time()
     if ismain:
         print("batch shapes:")
         jax.tree_map(lambda x: print(x.shape), next(train_iter))
     
-    local_core_on_chip = jax.device_put_sharded([jax.numpy.int32(i) for i in range(8)], local_devices)  
+    local_core_on_chip = jax.device_put_sharded([jax.numpy.int32(i) for i in range(local_device_count)], local_devices)  
     global_rng = jax.random.PRNGKey(jax.process_index()) #set seed to process index so different nodes dont receive same rngs
     loss_metric = jax.device_put_replicated(jax.numpy.float32(0.), local_devices)
     gnorm_metric = jax.device_put_replicated(jax.numpy.float32(0.), local_devices)
     
     print('starting training')
     for global_step in range(start_step, targs.iterations + 1):
-        batch = next(train_iter)
+        try:
+            batch = next(train_iter)
+            if global_step == start_step:
+                jax.tree_map(lambda x: print(x.shape) if hasattr(x, "shape") else _, batch)
+                print(jnp.var(batch["t5_emb"]), jnp.var(batch["clip_emb"]), jnp.var(batch["image"]) )
+        except StopIteration:
+            print("This epoch is complete!") #manual restart it if its done and you want >1 epochs.
+            break
+
         global_rng, *train_step_rng = jax.random.split(global_rng, num=local_device_count + 1)
         train_step_rng = jax.device_put_sharded(train_step_rng, local_devices)
 

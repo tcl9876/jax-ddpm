@@ -28,11 +28,14 @@ def get_config():
             args=D(
                 image_size=256,
                 resize_method='random_crop',
-                image_format='jpg'
+                image_format='jpg',
+                number_sample_per_shard=10000,
+                number_encodings_per_shard=5120,
+                remove_keys=["image_smaller"]
             ),
         ),
         sampler='ddim',
-        in_dimensions=[32,32,4],
+        in_dimensions=[64,64,4],
         model=D(
             # architecture
             name='unet_iddpm',
@@ -41,7 +44,7 @@ def get_config():
                 emb_ch=384,  # default is ch * 4
                 ch_mult=[1, 2, 3, 3],
                 num_res_blocks=3,
-                attn_resolutions=[16, 8, 4],
+                attn_resolutions=[32, 16, 8],
                 head_dim=128,
                 dropout=0.0,
                 logsnr_scale_range=(-7., 7.),
@@ -64,7 +67,7 @@ def get_config():
             eval_alpha_schedule=D(name='linear', beta_start=0.00085, beta_end=0.012, steps=1000),
             tmin=5,
             eval_clip_denoised=False,
-            t5_model_id="t5-large",
+            t5_model_id="google/t5-v1_1-xxl",
             clip_model_id="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
             vae_id="CompVis/stable-diffusion-v1-4"
         ),
@@ -79,7 +82,7 @@ def get_config():
             weight_decay=0.01,
             ema_decay=0.9999,
             grad_clip=1.0,
-            enable_update_skip=False,
+            enable_update_skip=True,
             log_loss_every_steps=500,
             snapshot_freq=5000,
             log_dir="{}/logs",

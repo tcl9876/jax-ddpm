@@ -28,7 +28,10 @@ def get_config():
             args=D(
                 image_size=512,
                 resize_method='random_crop',
-                image_format='jpg'
+                image_format='jpg',
+                number_sample_per_shard=10000,
+                number_encodings_per_shard=5120,
+                remove_keys=["image_smaller"]
             ),
         ),
         sampler='ddim',
@@ -78,7 +81,7 @@ def get_config():
             weight_decay=0.02,
             ema_decay=0.9999,
             grad_clip=1.0,
-            enable_update_skip=False,
+            enable_update_skip=True,
             # logging
             log_loss_every_steps=500,
             snapshot_freq=5000,
